@@ -57,6 +57,8 @@ class PendingItem:
     request: Any
     rendered: Any
     future: asyncio.Future[dict[str, Any]]
+    tenant_id: str = "anon"
+    enqueued_at: float = 0.0
 
 
 class FairQueue:
@@ -312,6 +314,7 @@ def create_app(
     fair_q = FairQueue()
     cond = asyncio.Condition()
     stop_flag = False
+    access_log = logging.getLogger("uvicorn.error")
 
     async def batch_worker() -> None:
         while True:
@@ -356,10 +359,37 @@ def create_app(
                 continue
 
             try:
+                t_eval0 = time.monotonic()
                 rows_list = await asyncio.to_thread(
                     decider.eval_batch, [item.rendered for item in batch]
                 )
+                t_eval1 = time.monotonic()
+                eval_ms = max(t_eval1 - t_eval0, 1e-6) * 1000.0
+                tok_s = batch_tokens / max(t_eval1 - t_eval0, 1e-6)
+                bs = len(batch)
                 for item, rows in zip(batch, rows_list, strict=True):
+                    wait_ms = max(0.0, (t_eval0 - item.enqueued_at) * 1000.0) if item.enqueued_at > 0 else 0.0
+                    if bs == 1:
+                        access_log.info(
+                            "systemone [%s] %d tok (%dq) | %.0fms (%.0f tok/s) | queue %.0fms",
+                            item.tenant_id,
+                            item.rendered.tokens(),
+                            len(item.rendered.questions),
+                            eval_ms,
+                            tok_s,
+                            wait_ms,
+                        )
+                    else:
+                        access_log.info(
+                            "systemone [%s] %d tok (%dq) | batch=%d %.0fms (%.0f tok/s) | queue %.0fms",
+                            item.tenant_id,
+                            item.rendered.tokens(),
+                            len(item.rendered.questions),
+                            bs,
+                            eval_ms,
+                            tok_s,
+                            wait_ms,
+                        )
                     if not item.future.done():
                         item.future.set_result(
                             response(item.request, item.rendered, rows, decider.ids)
@@ -404,7 +434,16 @@ def create_app(
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
         async with cond:
-            fair_q.push(tenant_id, PendingItem(request=request, rendered=rendered, future=fut))
+            fair_q.push(
+                tenant_id,
+                PendingItem(
+                    request=request,
+                    rendered=rendered,
+                    future=fut,
+                    tenant_id=tenant_id,
+                    enqueued_at=time.monotonic(),
+                ),
+            )
             cond.notify()
         return await asyncio.shield(fut)
 
