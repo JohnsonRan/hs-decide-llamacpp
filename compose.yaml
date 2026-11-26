@@ -36,6 +36,8 @@ services:
       DECIDE_GPU_LAYERS: ${DECIDE_GPU_LAYERS:--1}
       DECIDE_THREADS: ${DECIDE_THREADS:-4}
       DECIDE_FLASH_ATTN: ${DECIDE_FLASH_ATTN:-auto}
+      DECIDE_LOG_SLOW_MS: ${DECIDE_LOG_SLOW_MS:-1000}
+      DECIDE_LOG_COLOR: ${DECIDE_LOG_COLOR:-always}
     healthcheck:
       test: [CMD, /opt/venv/bin/python, -c, "import os, urllib.request as u; u.urlopen(u.Request('http://127.0.0.1:8000/health', headers={'Authorization': 'Bearer ' + os.environ['DECIDE_API_KEY']}), timeout=5)"]
       interval: 30s

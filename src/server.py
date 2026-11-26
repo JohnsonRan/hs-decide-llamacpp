@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 import subprocess
+import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -22,6 +23,108 @@ logger = logging.getLogger("hindsight_decision_llamacpp")
 SERVER = "hindsight-decision-serve-llamacpp"
 MODEL_NAME = "hs-decide-1-flash"
 DEFAULT_SHIM_LIB = "/opt/llamacpp/lib/libhs_decide_llama.so"
+
+_ANSI_RESET = "\033[0m"
+_ANSI_DIM = "\033[2m"
+_ANSI_RED = "\033[31m"
+_ANSI_BOLD_RED = "\033[1;31m"
+_ANSI_GREEN = "\033[32m"
+_ANSI_YELLOW = "\033[33m"
+_ANSI_BOLD_YELLOW = "\033[1;33m"
+
+
+def resolve_log_color(mode: str) -> bool:
+    """Resolve CLI/env color setting ('always', 'never', or 'auto') into a boolean."""
+    norm = mode.strip().lower()
+    if norm == "always":
+        return True
+    if norm == "never":
+        return False
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+@dataclass
+class RequestMetrics:
+    tokens: int = 0
+    questions: int = 0
+    eval_ms: float = 0.0
+    tok_s: float = 0.0
+    wait_ms: float = 0.0
+    batch_size: int = 1
+
+
+def setup_request_logger() -> logging.Logger:
+    """Configure dedicated single-line stdout request logger and fallback warning handler."""
+    req_log = logging.getLogger("hindsight_decision_llamacpp.access")
+    req_log.setLevel(logging.INFO)
+    req_log.propagate = False
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    req_log.handlers = [handler]
+
+    if not logger.handlers:
+        warn_handler = logging.StreamHandler(sys.stdout)
+        warn_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logger.addHandler(warn_handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return req_log
+
+
+def format_request_log(
+    ts: str,
+    status: int,
+    tenant_id: str,
+    client_ip: str,
+    method: str,
+    path: str,
+    total_ms: float,
+    metrics: RequestMetrics | None,
+    slow_ms: int,
+    use_color: bool,
+    error: str | None = None,
+) -> str:
+    """Format one aligned request log line with ANSI highlighting for >slow_ms and errors."""
+    is_error = status >= 400
+    is_severe = status >= 500
+
+    if metrics is not None:
+        shown_ms = int(round(metrics.eval_ms))
+        extra: list[str] = []
+        if metrics.batch_size > 1:
+            extra.append(f"b={metrics.batch_size}")
+        shown_wait = int(round(metrics.wait_ms))
+        if shown_wait > 0:
+            extra.append(f"queue {shown_wait}ms")
+        suffix = ("  " + "  ".join(extra)) if extra else ""
+        left = f"{metrics.tokens:>4d} tok ({metrics.questions:>2d}q)"
+        right = f"  {metrics.tok_s:>4.0f} tok/s{suffix}"
+    else:
+        shown_ms = int(round(total_ms))
+        route = f"{method} {path}"
+        left = f"{route:<20}"
+        right = f"  {error}" if error else ""
+
+    is_slow = (not is_error) and slow_ms > 0 and shown_ms > slow_ms
+    ms_str = f"{shown_ms:>4d}ms"
+    header_plain = f"{ts}  {status:>3d}  {tenant_id:<3}  {client_ip:<15}  {left}"
+    plain = f"{header_plain}  {ms_str}{right}"
+
+    if not use_color:
+        return plain
+    if is_severe:
+        return f"{_ANSI_BOLD_RED}{plain}{_ANSI_RESET}"
+    if is_error:
+        return f"{_ANSI_RED}{plain}{_ANSI_RESET}"
+    if is_slow:
+        return (
+            f"{_ANSI_YELLOW}{header_plain}  "
+            f"{_ANSI_BOLD_YELLOW}{ms_str}{_ANSI_RESET}{_ANSI_YELLOW}{right}{_ANSI_RESET}"
+        )
+    return (
+        f"{_ANSI_DIM}{ts}{_ANSI_RESET}  {_ANSI_GREEN}{status:>3d}{_ANSI_RESET}  "
+        f"{tenant_id:<3}  {client_ip:<15}  {left}  {ms_str}{right}"
+    )
 
 
 def parse_api_keys(primary: str | None, extra_csv: str | None) -> list[str]:
@@ -59,6 +162,7 @@ class PendingItem:
     future: asyncio.Future[dict[str, Any]]
     tenant_id: str = "anon"
     enqueued_at: float = 0.0
+    metrics: RequestMetrics | None = None
 
 
 class FairQueue:
@@ -300,6 +404,8 @@ def create_app(
     revision: str | None,
     api_keys: list[str],
     batch_wait_ms: int,
+    slow_ms: int = 1000,
+    use_color: bool = True,
 ) -> Any:
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
@@ -314,7 +420,7 @@ def create_app(
     fair_q = FairQueue()
     cond = asyncio.Condition()
     stop_flag = False
-    access_log = logging.getLogger("uvicorn.error")
+    req_log = setup_request_logger()
 
     async def batch_worker() -> None:
         while True:
@@ -369,27 +475,13 @@ def create_app(
                 bs = len(batch)
                 for item, rows in zip(batch, rows_list, strict=True):
                     wait_ms = max(0.0, (t_eval0 - item.enqueued_at) * 1000.0) if item.enqueued_at > 0 else 0.0
-                    if bs == 1:
-                        access_log.info(
-                            "systemone [%s] %d tok (%dq) | %.0fms (%.0f tok/s) | queue %.0fms",
-                            item.tenant_id,
-                            item.rendered.tokens(),
-                            len(item.rendered.questions),
-                            eval_ms,
-                            tok_s,
-                            wait_ms,
-                        )
-                    else:
-                        access_log.info(
-                            "systemone [%s] %d tok (%dq) | batch=%d %.0fms (%.0f tok/s) | queue %.0fms",
-                            item.tenant_id,
-                            item.rendered.tokens(),
-                            len(item.rendered.questions),
-                            bs,
-                            eval_ms,
-                            tok_s,
-                            wait_ms,
-                        )
+                    if item.metrics is not None:
+                        item.metrics.tokens = item.rendered.tokens()
+                        item.metrics.questions = len(item.rendered.questions)
+                        item.metrics.eval_ms = eval_ms
+                        item.metrics.tok_s = tok_s
+                        item.metrics.wait_ms = wait_ms
+                        item.metrics.batch_size = bs
                     if not item.future.done():
                         item.future.set_result(
                             response(item.request, item.rendered, rows, decider.ids)
@@ -416,16 +508,88 @@ def create_app(
 
     @server.middleware("http")
     async def check_key_and_report_identity(raw_request: Request, call_next: Any) -> Any:
+        t_req0 = time.monotonic()
+        client_ip = raw_request.client.host if raw_request.client else "-"
+        method = raw_request.method
+        path = raw_request.url.path
         given = raw_request.headers.get("authorization", "")
         tenant = match_tenant(given, api_keys)
         if tenant is None:
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
+            req_log.info(
+                format_request_log(
+                    time.strftime("%m-%d %H:%M:%S"),
+                    401,
+                    "-",
+                    client_ip,
+                    method,
+                    path,
+                    (time.monotonic() - t_req0) * 1000.0,
+                    None,
+                    slow_ms,
+                    use_color,
+                )
+            )
+            return resp
         raw_request.state.tenant_id = tenant
-        resp = await call_next(raw_request)
+        raw_request.state.metrics = None
+        try:
+            resp = await call_next(raw_request)
+        except asyncio.CancelledError:
+            req_log.info(
+                format_request_log(
+                    time.strftime("%m-%d %H:%M:%S"),
+                    499,
+                    tenant,
+                    client_ip,
+                    method,
+                    path,
+                    (time.monotonic() - t_req0) * 1000.0,
+                    None,
+                    slow_ms,
+                    use_color,
+                    error="cancelled",
+                )
+            )
+            raise
+        except Exception as exc:
+            req_log.info(
+                format_request_log(
+                    time.strftime("%m-%d %H:%M:%S"),
+                    500,
+                    tenant,
+                    client_ip,
+                    method,
+                    path,
+                    (time.monotonic() - t_req0) * 1000.0,
+                    None,
+                    slow_ms,
+                    use_color,
+                    error=type(exc).__name__,
+                )
+            )
+            raise
         resp.headers.update(served.headers())
+        if not (path == "/health" and resp.status_code == 200):
+            m = getattr(raw_request.state, "metrics", None)
+            used_metrics = m if (isinstance(m, RequestMetrics) and m.tokens > 0) else None
+            req_log.info(
+                format_request_log(
+                    time.strftime("%m-%d %H:%M:%S"),
+                    resp.status_code,
+                    tenant,
+                    client_ip,
+                    method,
+                    path,
+                    (time.monotonic() - t_req0) * 1000.0,
+                    used_metrics,
+                    slow_ms,
+                    use_color,
+                )
+            )
         return resp
 
-    async def respond_for(request: Any, tenant_id: str) -> dict[str, Any]:
+    async def respond_for(request: Any, tenant_id: str, metrics: RequestMetrics) -> dict[str, Any]:
         rendered = render_request(decider.tokenizer, request, decider.settings)
         if rendered.tokens() > decider.max_batch_tokens:
             raise RuntimeError(
@@ -442,6 +606,7 @@ def create_app(
                     future=fut,
                     tenant_id=tenant_id,
                     enqueued_at=time.monotonic(),
+                    metrics=metrics,
                 ),
             )
             cond.notify()
@@ -450,7 +615,9 @@ def create_app(
     @server.post("/v1/systemone")
     async def systemone(raw_request: Request) -> Any:
         tenant_id = getattr(raw_request.state, "tenant_id", "anon")
-        return await answer_body(raw_request, lambda req: respond_for(req, tenant_id))
+        metrics = RequestMetrics()
+        raw_request.state.metrics = metrics
+        return await answer_body(raw_request, lambda req: respond_for(req, tenant_id, metrics))
 
     @server.get("/v1/models")
     async def models() -> Any:
@@ -499,6 +666,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gpu-layers", type=int, default=-1)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--flash-attn", choices=["auto", "on", "off"], default="auto")
+    parser.add_argument(
+        "--slow-ms",
+        type=int,
+        default=int((os.environ.get("DECIDE_LOG_SLOW_MS") or "").strip() or "1000"),
+    )
+    parser.add_argument(
+        "--log-color",
+        choices=["always", "auto", "never"],
+        default=(
+            (os.environ.get("DECIDE_LOG_COLOR") or "").strip().lower()
+            or ("never" if os.environ.get("NO_COLOR") else "always")
+        ),
+    )
     args = parser.parse_args(argv)
 
     import uvicorn
@@ -520,9 +700,18 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Serving {args.gguf} ({decider.engine_version()}, keys={len(api_keys)})", flush=True)
     uvicorn.run(
-        create_app(decider, args.model_dir, args.revision, api_keys, args.batch_wait_ms),
+        create_app(
+            decider,
+            args.model_dir,
+            args.revision,
+            api_keys,
+            args.batch_wait_ms,
+            slow_ms=args.slow_ms,
+            use_color=resolve_log_color(args.log_color),
+        ),
         host=args.host,
         port=args.port,
+        access_log=False,
     )
 
 
