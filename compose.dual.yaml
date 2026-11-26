@@ -3,6 +3,12 @@
 # than the single-instance default in compose.yaml.
 name: hs-decide-llamacpp-dual
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
 x-decide-common: &decide-common
   build:
     context: .
@@ -12,10 +18,11 @@ x-decide-common: &decide-common
   image: hs-decide-llamacpp:cu${CUDA_ARCH:-61}
   platform: linux/amd64
   restart: unless-stopped
+  logging: *default-logging
   stop_grace_period: ${STOP_GRACE_PERIOD:-30s}
   gpus: all
   environment:
-    TZ: "Asia/Tokyo"
+    TZ: "${TZ:-UTC}"
     DECIDE_API_KEY: ${DECIDE_API_KEY:?Set DECIDE_API_KEY in .env}
     DECIDE_EXTRA_API_KEYS: ${DECIDE_EXTRA_API_KEYS:-}
     DECIDE_MAX_REQUEST_TOKENS: ${DECIDE_MAX_REQUEST_TOKENS:-8192}
@@ -45,6 +52,7 @@ services:
   proxy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       decide-1:
         condition: service_healthy

@@ -1,6 +1,12 @@
 # Default deployment: single llama.cpp Q8_0 instance (~2.0 GB VRAM) with multi-key fair round-robin queue.
 name: hs-decide-llamacpp
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
 services:
   decide:
     build:
@@ -11,12 +17,13 @@ services:
     image: hs-decide-llamacpp:cu${CUDA_ARCH:-61}
     platform: linux/amd64
     restart: unless-stopped
+    logging: *default-logging
     stop_grace_period: ${STOP_GRACE_PERIOD:-30s}
     gpus: all
     ports:
       - "${DECIDE_BIND_ADDRESS:-127.0.0.1}:${DECIDE_PORT:-8000}:8000"
     environment:
-      TZ: "Asia/Tokyo"
+      TZ: "${TZ:-UTC}"
       DECIDE_API_KEY: ${DECIDE_API_KEY:?Set DECIDE_API_KEY in .env}
       DECIDE_EXTRA_API_KEYS: ${DECIDE_EXTRA_API_KEYS:-}
       DECIDE_MAX_REQUEST_TOKENS: ${DECIDE_MAX_REQUEST_TOKENS:-8192}
