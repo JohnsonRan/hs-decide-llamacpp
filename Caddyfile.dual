@@ -1,0 +1,6 @@
+:8000 {
+	reverse_proxy decide-1:8000 decide-2:8000 {
+		lb_policy least_conn
+		fail_duration 10s
+	}
+}

@@ -1,0 +1,37 @@
+# Default deployment: single llama.cpp Q8_0 instance (~2.0 GB VRAM) with multi-key fair round-robin queue.
+name: hs-decide-llamacpp
+
+services:
+  decide:
+    build:
+      context: .
+      args:
+        CUDA_ARCH: ${CUDA_ARCH:-61}
+        BUILD_JOBS: ${BUILD_JOBS:-3}
+    image: hs-decide-llamacpp:cu${CUDA_ARCH:-61}
+    platform: linux/amd64
+    restart: unless-stopped
+    stop_grace_period: ${STOP_GRACE_PERIOD:-30s}
+    gpus: all
+    ports:
+      - "${DECIDE_BIND_ADDRESS:-127.0.0.1}:${DECIDE_PORT:-8000}:8000"
+    environment:
+      TZ: "Asia/Tokyo"
+      DECIDE_API_KEY: ${DECIDE_API_KEY:?Set DECIDE_API_KEY in .env}
+      DECIDE_EXTRA_API_KEYS: ${DECIDE_EXTRA_API_KEYS:-}
+      DECIDE_MAX_REQUEST_TOKENS: ${DECIDE_MAX_REQUEST_TOKENS:-8192}
+      DECIDE_CTX_SIZE: ${DECIDE_CTX_SIZE:-8192}
+      DECIDE_UBATCH_SIZE: ${DECIDE_UBATCH_SIZE:-1024}
+      DECIDE_MAX_BATCH_SIZE: ${DECIDE_MAX_BATCH_SIZE:-1}
+      DECIDE_MAX_BATCH_TOKENS: ${DECIDE_MAX_BATCH_TOKENS:-8192}
+      DECIDE_MAX_OUTPUTS: ${DECIDE_MAX_OUTPUTS:-256}
+      DECIDE_BATCH_WAIT_MS: ${DECIDE_BATCH_WAIT_MS:-0}
+      DECIDE_GPU_LAYERS: ${DECIDE_GPU_LAYERS:--1}
+      DECIDE_THREADS: ${DECIDE_THREADS:-4}
+      DECIDE_FLASH_ATTN: ${DECIDE_FLASH_ATTN:-auto}
+    healthcheck:
+      test: [CMD, /opt/venv/bin/python, -c, "import os, urllib.request as u; u.urlopen(u.Request('http://127.0.0.1:8000/health', headers={'Authorization': 'Bearer ' + os.environ['DECIDE_API_KEY']}), timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

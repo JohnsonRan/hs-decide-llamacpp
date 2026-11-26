@@ -1,0 +1,56 @@
+# Optional dual-instance deployment (~4.0 GB VRAM total) behind Caddy least_conn load balancing.
+# Isolates short requests (~0.33s) from concurrent 7k-token requests at ~8% lower peak throughput
+# than the single-instance default in compose.yaml.
+name: hs-decide-llamacpp-dual
+
+x-decide-common: &decide-common
+  build:
+    context: .
+    args:
+      CUDA_ARCH: ${CUDA_ARCH:-61}
+      BUILD_JOBS: ${BUILD_JOBS:-3}
+  image: hs-decide-llamacpp:cu${CUDA_ARCH:-61}
+  platform: linux/amd64
+  restart: unless-stopped
+  stop_grace_period: ${STOP_GRACE_PERIOD:-30s}
+  gpus: all
+  environment:
+    TZ: "Asia/Tokyo"
+    DECIDE_API_KEY: ${DECIDE_API_KEY:?Set DECIDE_API_KEY in .env}
+    DECIDE_EXTRA_API_KEYS: ${DECIDE_EXTRA_API_KEYS:-}
+    DECIDE_MAX_REQUEST_TOKENS: ${DECIDE_MAX_REQUEST_TOKENS:-8192}
+    DECIDE_CTX_SIZE: ${DECIDE_CTX_SIZE:-8192}
+    DECIDE_UBATCH_SIZE: ${DECIDE_UBATCH_SIZE:-1024}
+    DECIDE_MAX_BATCH_SIZE: ${DECIDE_MAX_BATCH_SIZE:-1}
+    DECIDE_MAX_BATCH_TOKENS: ${DECIDE_MAX_BATCH_TOKENS:-8192}
+    DECIDE_MAX_OUTPUTS: ${DECIDE_MAX_OUTPUTS:-256}
+    DECIDE_BATCH_WAIT_MS: ${DECIDE_BATCH_WAIT_MS:-0}
+    DECIDE_GPU_LAYERS: ${DECIDE_GPU_LAYERS:--1}
+    DECIDE_THREADS: ${DECIDE_THREADS:-4}
+    DECIDE_FLASH_ATTN: ${DECIDE_FLASH_ATTN:-auto}
+  healthcheck:
+    test: [CMD, /opt/venv/bin/python, -c, "import os, urllib.request as u; u.urlopen(u.Request('http://127.0.0.1:8000/health', headers={'Authorization': 'Bearer ' + os.environ['DECIDE_API_KEY']}), timeout=5)"]
+    interval: 30s
+    timeout: 10s
+    retries: 5
+    start_period: 60s
+
+services:
+  decide-1:
+    <<: *decide-common
+
+  decide-2:
+    <<: *decide-common
+
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      decide-1:
+        condition: service_healthy
+      decide-2:
+        condition: service_healthy
+    ports:
+      - "${DECIDE_BIND_ADDRESS:-127.0.0.1}:${DECIDE_PORT:-8000}:8000"
+    volumes:
+      - ./Caddyfile.dual:/etc/caddy/Caddyfile:ro
