@@ -53,6 +53,15 @@ class RequestMetrics:
     batch_size: int = 1
 
 
+def ensure_warning_logger() -> None:
+    if not logger.handlers:
+        warn_handler = logging.StreamHandler(sys.stdout)
+        warn_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        logger.addHandler(warn_handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+
 def setup_request_logger() -> logging.Logger:
     """Configure dedicated single-line stdout request logger and fallback warning handler."""
     req_log = logging.getLogger("hindsight_decision_llamacpp.access")
@@ -62,12 +71,7 @@ def setup_request_logger() -> logging.Logger:
     handler.setFormatter(logging.Formatter("%(message)s"))
     req_log.handlers = [handler]
 
-    if not logger.handlers:
-        warn_handler = logging.StreamHandler(sys.stdout)
-        warn_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-        logger.addHandler(warn_handler)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
+    ensure_warning_logger()
     return req_log
 
 
@@ -265,6 +269,30 @@ def limited(settings: Any, max_request_tokens: int | None) -> Any:
     return settings.model_copy(update={"max_request_tokens": max_request_tokens})
 
 
+def resolve_token_limits(
+    model_max_request_tokens: int,
+    max_request_tokens: int | None,
+    ctx_size: int,
+    max_batch_tokens: int,
+) -> tuple[int, int, int]:
+    """Ensure effective request, context, and batch token limits stay mutually consistent."""
+    if ctx_size <= 0 or max_batch_tokens <= 0:
+        raise ValueError(
+            f"ctx_size ({ctx_size}) and max_batch_tokens ({max_batch_tokens}) must be positive"
+        )
+    if max_request_tokens is None:
+        eff_req = min(model_max_request_tokens, ctx_size)
+    else:
+        if not 0 < max_request_tokens <= model_max_request_tokens:
+            raise ValueError(
+                f"max_request_tokens must be 1 to {model_max_request_tokens}, not {max_request_tokens}"
+            )
+        eff_req = max_request_tokens
+    eff_ctx = max(ctx_size, eff_req)
+    eff_batch = max(max_batch_tokens, eff_ctx)
+    return eff_req, eff_ctx, eff_batch
+
+
 def detect_device_label(gpu_layers: int) -> str:
     if gpu_layers == 0:
         return "cpu"
@@ -289,10 +317,10 @@ class LlamaCppDecider:
         *,
         shim_lib: str = DEFAULT_SHIM_LIB,
         max_request_tokens: int | None = None,
-        ctx_size: int = 8192,
+        ctx_size: int = 16384,
         ubatch_size: int = 1024,
         max_batch_size: int = 1,
-        max_batch_tokens: int = 8192,
+        max_batch_tokens: int = 16384,
         max_outputs: int = 256,
         gpu_layers: int = -1,
         threads: int = 4,
@@ -302,17 +330,36 @@ class LlamaCppDecider:
         from hindsight_decision.typed import classifier_ids
         from transformers import AutoTokenizer
 
+        raw_settings = load_settings(folder)
+        eff_req, eff_ctx, eff_batch = resolve_token_limits(
+            raw_settings.max_request_tokens,
+            max_request_tokens,
+            ctx_size,
+            max_batch_tokens,
+        )
+        if eff_ctx != ctx_size or eff_batch != max_batch_tokens:
+            ensure_warning_logger()
+            logger.warning(
+                "Auto-aligned token limits from (req=%s, ctx=%d, batch=%d) to (req=%d, ctx=%d, batch=%d)",
+                max_request_tokens,
+                ctx_size,
+                max_batch_tokens,
+                eff_req,
+                eff_ctx,
+                eff_batch,
+            )
+
         self.folder = folder
         self.gguf_path = gguf_path
-        self.settings = limited(load_settings(folder), max_request_tokens)
+        self.settings = limited(raw_settings, eff_req)
         self.tokenizer = AutoTokenizer.from_pretrained(folder)
         self.ids = classifier_ids(self.tokenizer)
         self.n_cls = len(self.ids)
         self._cls_arr = (ctypes.c_int32 * self.n_cls)(*self.ids)
-        self.ctx_size = ctx_size
+        self.ctx_size = eff_ctx
         self.ubatch_size = ubatch_size
         self.max_batch_size = max(1, max_batch_size)
-        self.max_batch_tokens = max_batch_tokens
+        self.max_batch_tokens = eff_batch
         self.max_outputs = max_outputs
         self.gpu_layers = gpu_layers
 
@@ -320,8 +367,8 @@ class LlamaCppDecider:
         self._lib = load_shim(shim_lib)
         self._eng = self._lib.hs_engine_create(
             str(gguf_path).encode("utf-8"),
-            ctx_size,
-            max_batch_tokens,
+            self.ctx_size,
+            self.max_batch_tokens,
             ubatch_size,
             self.max_batch_size,
             max_outputs,
@@ -409,6 +456,7 @@ def create_app(
 ) -> Any:
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
+    from hindsight_decision import schema
     from hindsight_decision.endpoint import answer_body
     from hindsight_decision.identity import identity, models_with_identity
     from hindsight_decision.typed import response
@@ -591,9 +639,10 @@ def create_app(
 
     async def respond_for(request: Any, tenant_id: str, metrics: RequestMetrics) -> dict[str, Any]:
         rendered = render_request(decider.tokenizer, request, decider.settings)
-        if rendered.tokens() > decider.max_batch_tokens:
-            raise RuntimeError(
-                f"rendered tokens {rendered.tokens()} > max_batch_tokens {decider.max_batch_tokens}"
+        limit = min(decider.max_batch_tokens, decider.ctx_size)
+        if rendered.tokens() > limit:
+            raise schema.ContextOverflow(
+                f"{rendered.tokens()} tokens is over this server's limit of {limit} tokens"
             )
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -657,10 +706,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--extra-api-keys", default=os.environ.get("DECIDE_EXTRA_API_KEYS", ""))
     parser.add_argument("--max-request-tokens", type=int, default=None)
-    parser.add_argument("--ctx-size", type=int, default=8192)
+    parser.add_argument("--ctx-size", type=int, default=16384)
     parser.add_argument("--ubatch-size", type=int, default=1024)
     parser.add_argument("--max-batch-size", type=int, default=1)
-    parser.add_argument("--max-batch-tokens", type=int, default=8192)
+    parser.add_argument("--max-batch-tokens", type=int, default=16384)
     parser.add_argument("--max-outputs", type=int, default=256)
     parser.add_argument("--batch-wait-ms", type=int, default=0)
     parser.add_argument("--gpu-layers", type=int, default=-1)

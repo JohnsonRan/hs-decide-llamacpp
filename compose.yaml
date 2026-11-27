@@ -1,4 +1,4 @@
-# Default deployment: single llama.cpp Q8_0 instance (~2.0 GB VRAM) with multi-key fair round-robin queue.
+# Default deployment: single llama.cpp Q8_0 instance (~2.4 GB VRAM at ctx=16384) with multi-key fair round-robin queue.
 name: hs-decide-llamacpp
 
 x-logging: &default-logging
@@ -26,11 +26,11 @@ services:
       TZ: "${TZ:-UTC}"
       DECIDE_API_KEY: ${DECIDE_API_KEY:?Set DECIDE_API_KEY in .env}
       DECIDE_EXTRA_API_KEYS: ${DECIDE_EXTRA_API_KEYS:-}
-      DECIDE_MAX_REQUEST_TOKENS: ${DECIDE_MAX_REQUEST_TOKENS:-8192}
-      DECIDE_CTX_SIZE: ${DECIDE_CTX_SIZE:-8192}
+      DECIDE_MAX_REQUEST_TOKENS: ${DECIDE_MAX_REQUEST_TOKENS:-16384}
+      DECIDE_CTX_SIZE: ${DECIDE_CTX_SIZE:-16384}
       DECIDE_UBATCH_SIZE: ${DECIDE_UBATCH_SIZE:-1024}
       DECIDE_MAX_BATCH_SIZE: ${DECIDE_MAX_BATCH_SIZE:-1}
-      DECIDE_MAX_BATCH_TOKENS: ${DECIDE_MAX_BATCH_TOKENS:-8192}
+      DECIDE_MAX_BATCH_TOKENS: ${DECIDE_MAX_BATCH_TOKENS:-16384}
       DECIDE_MAX_OUTPUTS: ${DECIDE_MAX_OUTPUTS:-256}
       DECIDE_BATCH_WAIT_MS: ${DECIDE_BATCH_WAIT_MS:-0}
       DECIDE_GPU_LAYERS: ${DECIDE_GPU_LAYERS:--1}

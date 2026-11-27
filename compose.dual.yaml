@@ -1,4 +1,4 @@
-# Optional dual-instance deployment (~4.0 GB VRAM total) behind Caddy least_conn load balancing.
+# Optional dual-instance deployment (~4.8 GB VRAM total at ctx=16384) behind Caddy least_conn load balancing.
 # Isolates short requests (~0.33s) from concurrent 7k-token requests at ~8% lower peak throughput
 # than the single-instance default in compose.yaml.
 name: hs-decide-llamacpp-dual
@@ -25,11 +25,11 @@ x-decide-common: &decide-common
     TZ: "${TZ:-UTC}"
     DECIDE_API_KEY: ${DECIDE_API_KEY:?Set DECIDE_API_KEY in .env}
     DECIDE_EXTRA_API_KEYS: ${DECIDE_EXTRA_API_KEYS:-}
-    DECIDE_MAX_REQUEST_TOKENS: ${DECIDE_MAX_REQUEST_TOKENS:-8192}
-    DECIDE_CTX_SIZE: ${DECIDE_CTX_SIZE:-8192}
+    DECIDE_MAX_REQUEST_TOKENS: ${DECIDE_MAX_REQUEST_TOKENS:-16384}
+    DECIDE_CTX_SIZE: ${DECIDE_CTX_SIZE:-16384}
     DECIDE_UBATCH_SIZE: ${DECIDE_UBATCH_SIZE:-1024}
     DECIDE_MAX_BATCH_SIZE: ${DECIDE_MAX_BATCH_SIZE:-1}
-    DECIDE_MAX_BATCH_TOKENS: ${DECIDE_MAX_BATCH_TOKENS:-8192}
+    DECIDE_MAX_BATCH_TOKENS: ${DECIDE_MAX_BATCH_TOKENS:-16384}
     DECIDE_MAX_OUTPUTS: ${DECIDE_MAX_OUTPUTS:-256}
     DECIDE_BATCH_WAIT_MS: ${DECIDE_BATCH_WAIT_MS:-0}
     DECIDE_GPU_LAYERS: ${DECIDE_GPU_LAYERS:--1}

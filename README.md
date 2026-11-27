@@ -93,6 +93,8 @@ HINDSIGHT_API_DECISION_MODEL_MAX_REQUEST_TOKENS=7000
 HINDSIGHT_API_DECISION_MODEL_TIMEOUT=180
 ```
 
+The server defaults to `DECIDE_CTX_SIZE=16384` / `DECIDE_MAX_REQUEST_TOKENS=16384` (`~2.4 GiB` VRAM) while clients stay at `7000`: Hindsight's client-side token estimate often undercounts CJK/code prompts relative to the `Qwen3.5` tokenizer, so the `16384` server headroom absorbs `8k–12k` rendered bursts without triggering `400 max_tokens_exceeded` (`retrying at 3500 tokens`) split retries.
+
 ## Benchmarking & Accuracy Tools
 
 Standard-library-only tools are included in `tools/`:
