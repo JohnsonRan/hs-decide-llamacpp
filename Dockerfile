@@ -124,9 +124,12 @@ ENV DECIDE_MAX_REQUEST_TOKENS=16384 \
     DECIDE_THREADS=4 \
     DECIDE_FLASH_ATTN=auto \
     DECIDE_EXTRA_API_KEYS="" \
+    DECIDE_MAX_QUEUE_SIZE=32 \
+    DECIDE_MAX_QUEUE_PER_KEY=16 \
+    DECIDE_QUEUE_TIMEOUT_S=60 \
     DECIDE_LOG_SLOW_MS=1000 \
     DECIDE_LOG_COLOR=always
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "exec python /opt/hs-decide-server/server.py /opt/hs-decide --gguf /opt/hs-decide/model.gguf --revision \"$HS_DECIDE_REVISION\" --host 0.0.0.0 --port 8000 --api-key \"$DECIDE_API_KEY\" --extra-api-keys \"$DECIDE_EXTRA_API_KEYS\" --max-request-tokens \"$DECIDE_MAX_REQUEST_TOKENS\" --ctx-size \"$DECIDE_CTX_SIZE\" --ubatch-size \"$DECIDE_UBATCH_SIZE\" --max-batch-size \"$DECIDE_MAX_BATCH_SIZE\" --max-batch-tokens \"$DECIDE_MAX_BATCH_TOKENS\" --max-outputs \"$DECIDE_MAX_OUTPUTS\" --batch-wait-ms \"$DECIDE_BATCH_WAIT_MS\" --gpu-layers \"$DECIDE_GPU_LAYERS\" --threads \"$DECIDE_THREADS\" --flash-attn \"$DECIDE_FLASH_ATTN\""]
+CMD ["sh", "-c", "exec python /opt/hs-decide-server/server.py /opt/hs-decide --gguf /opt/hs-decide/model.gguf --revision \"$HS_DECIDE_REVISION\" --host 0.0.0.0 --port 8000 --api-key \"$DECIDE_API_KEY\" --extra-api-keys \"$DECIDE_EXTRA_API_KEYS\" --max-request-tokens \"$DECIDE_MAX_REQUEST_TOKENS\" --ctx-size \"$DECIDE_CTX_SIZE\" --ubatch-size \"$DECIDE_UBATCH_SIZE\" --max-batch-size \"$DECIDE_MAX_BATCH_SIZE\" --max-batch-tokens \"$DECIDE_MAX_BATCH_TOKENS\" --max-outputs \"$DECIDE_MAX_OUTPUTS\" --batch-wait-ms \"$DECIDE_BATCH_WAIT_MS\" --gpu-layers \"$DECIDE_GPU_LAYERS\" --threads \"$DECIDE_THREADS\" --flash-attn \"$DECIDE_FLASH_ATTN\" --max-queue-size \"${DECIDE_MAX_QUEUE_SIZE:-32}\" --max-queue-per-key \"${DECIDE_MAX_QUEUE_PER_KEY:-16}\" --queue-timeout-s \"${DECIDE_QUEUE_TIMEOUT_S:-60}\""]

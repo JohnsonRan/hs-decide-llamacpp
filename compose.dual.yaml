@@ -1,6 +1,6 @@
-# Optional dual-instance deployment (~4.8 GB VRAM total at ctx=16384) behind Caddy least_conn load balancing.
-# Isolates short requests (~0.33s) from concurrent 7k-token requests at ~8% lower peak throughput
-# than the single-instance default in compose.yaml.
+# Optional dual-instance deployment (~4.1 GiB VRAM total at ctx=16384) behind Caddy least_conn load balancing.
+# Isolates short requests (~0.41s at 627 tok, ctx=16384) when at most one concurrent 7k-token request is running,
+# but short e2e p95 degrades under 2L+1S contention and long requests time-slice on GPU.
 name: hs-decide-llamacpp-dual
 
 x-logging: &default-logging
@@ -35,6 +35,9 @@ x-decide-common: &decide-common
     DECIDE_GPU_LAYERS: ${DECIDE_GPU_LAYERS:--1}
     DECIDE_THREADS: ${DECIDE_THREADS:-4}
     DECIDE_FLASH_ATTN: ${DECIDE_FLASH_ATTN:-auto}
+    DECIDE_MAX_QUEUE_SIZE: ${DECIDE_MAX_QUEUE_SIZE:-32}
+    DECIDE_MAX_QUEUE_PER_KEY: ${DECIDE_MAX_QUEUE_PER_KEY:-16}
+    DECIDE_QUEUE_TIMEOUT_S: ${DECIDE_QUEUE_TIMEOUT_S:-60}
     DECIDE_LOG_SLOW_MS: ${DECIDE_LOG_SLOW_MS:-1000}
     DECIDE_LOG_COLOR: ${DECIDE_LOG_COLOR:-always}
   healthcheck:

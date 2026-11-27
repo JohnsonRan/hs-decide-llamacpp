@@ -25,6 +25,8 @@ This project replaces only the forward pass with a thin `ctypes` shim over `llam
 | 7516 tok | `4.30s` · `1748 tok/s` · `0.23 req/s` | **`2.58s`** · **`2913 tok/s`** · **`0.39 req/s`** | **1.67×** |
 | **VRAM** | `5507 MiB / 7680 MiB` | **`1979 MiB` idle / `2007 MiB` peak** | **-63.6%** |
 
+At default `ctx=16384` (`batch=1`), `c=1` baseline sweep measures `2137 MiB` idle/peak VRAM (`627 tok` in `0.18s`, `1416 tok` in `0.41s`, `3501 tok` in `1.04s`, `7516 tok` in `2.58s`, and `11760 tok` in `4.64s`).
+
 ### Accuracy vs Transformers FP32 (`Q8_0_out_f32`, 14 EN/ZH cases, 202–6666 tokens)
 
 - **Choice Top-1 Agreement**: `14 / 14 (100.00%)` (0 flips across `choice` and `noul >= 0.5`)
@@ -36,8 +38,19 @@ This project replaces only the forward pass with a thin `ctypes` shim over `llam
 
 On Tesla P4, a single `llama.cpp Q8_0` request already saturates GPU compute (`95–100%` utilization):
 - **`llama_batch` multi-sequence batching (`batch<=2` / `batch<=4`) is slower for medium/long prompts** (`6.43s` vs `5.14s` at `c=2`, 7k tokens) because hybrid attention splits `ubatch` and adds scheduling overhead. Keep `DECIDE_MAX_BATCH_SIZE=1`.
-- **Single instance (`compose.yaml`, default)**: Highest peak throughput (`2007 MiB` VRAM) with built-in **per-API-key round-robin fair queue** so multiple users alternate fairly even under burst load.
-- **Dual instance (`compose.dual.yaml`, optional)**: Runs two independent `batch=1` containers (`~4.0 GiB` VRAM total) behind Caddy `least_conn`. Peak throughput is ~8% lower due to GPU time-slicing, **but short requests (~471 tok) complete in `0.33s` even while a `7516`-tok request is running on the other worker**.
+- **Single instance (`compose.yaml`, default)**: Highest peak throughput (`~2.0 GiB` VRAM at `ctx=8192`, `2137 MiB` / `~2.1 GiB` at default `ctx=16384`) with built-in **per-API-key round-robin fair queue** so multiple users alternate fairly even under burst load. **Recommended default for shared Hindsight production workloads**, where most calls are 5k–8k token consolidation/reflect requests.
+- **Dual instance (`compose.dual.yaml`, optional)**: Runs two independent `batch=1` containers (`4179 MiB` idle / `4235 MiB` peak, `~4.1 GiB` VRAM total at default `ctx=16384`) behind Caddy `least_conn`. Only useful when at most one long request runs concurrently with interactive short requests; once 2+ long requests overlap, both lanes saturate and short tail latency regresses past single-instance.
+
+#### Mixed Short + Long Workload (`ctx=16384, batch=1, duration=30s`, `short=627 tok`, `long=7516 tok`)
+
+| Scenario | Deployment | VRAM (Idle → Peak) | Short `ok` (`req/s`) | Short `e2e p50 / p95 / max` | Short `q_p50 / q_p95` | Long `e2e p50 / p95` | Total Throughput |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **1L+1S** (2 keys) | **Single** | `2137 → 2137 MiB` | `11` (`0.37`) | `2.74s / 2.77s / 2.77s` | `2543.8 / 2555.9 ms` | `2.74s / 2.75s` | **`2969 tok/s`** |
+| **1L+1S** (2 keys) | **Dual + Caddy** | `4179 → 4235 MiB` | `76` (`2.50`) | **`0.40s / 0.41s / 0.41s`** | **`0.1 / 0.2 ms`** | `5.31s / 5.32s` | **`2983 tok/s`** |
+| **2L+1S** (3 keys) | **Single** | `2137 → 2137 MiB` | `6` (`0.19`) | `5.31s / 5.34s / 5.34s` | `5118.9 / 5124.6 ms` | `5.31s / 5.32s` | **`2943 tok/s`** |
+| **2L+1S** (3 keys) | **Dual + Caddy** | `4179 → 4235 MiB` | `30` (`0.89`) | `0.41s / 5.87s / 5.93s` | `0.1 / 5528.3 ms` | `5.76s / 10.88s` | **`2794 tok/s`** |
+
+Use `tools/bench.py --mixed` to measure short-request `e2e p95`, queue wait, and aggregate throughput under multi-user contention before choosing single vs dual.
 
 ## Quick Start
 
@@ -93,7 +106,20 @@ HINDSIGHT_API_DECISION_MODEL_MAX_REQUEST_TOKENS=7000
 HINDSIGHT_API_DECISION_MODEL_TIMEOUT=180
 ```
 
-The server defaults to `DECIDE_CTX_SIZE=16384` / `DECIDE_MAX_REQUEST_TOKENS=16384` (`~2.4 GiB` VRAM) while clients stay at `7000`: Hindsight's client-side token estimate often undercounts CJK/code prompts relative to the `Qwen3.5` tokenizer, so the `16384` server headroom absorbs `8k–12k` rendered bursts without triggering `400 max_tokens_exceeded` (`retrying at 3500 tokens`) split retries.
+The server defaults to `DECIDE_CTX_SIZE=16384` / `DECIDE_MAX_REQUEST_TOKENS=16384` (`2137 MiB` / `~2.1 GiB` VRAM on Tesla P4) while clients stay at `7000`: Hindsight's client-side token estimate often undercounts CJK/code prompts relative to the `Qwen3.5` tokenizer, so the `16384` server headroom absorbs `8k–12k` rendered bursts without triggering `400 max_tokens_exceeded` (`retrying at 3500 tokens`) split retries.
+
+### Queue Protection & Timing Headers
+
+To keep shared endpoints responsive under bursts instead of accumulating unbounded backlog:
+
+| Env Var | Default | Behavior |
+| --- | ---: | --- |
+| `DECIDE_MAX_QUEUE_SIZE` | `32` | Global pending queue cap across all keys; rejects new requests with `503` + `Retry-After` (`0` disables) |
+| `DECIDE_MAX_QUEUE_PER_KEY` | `16` | Per-API-key pending queue cap; rejects noisy tenants with `429` + `Retry-After` before global cap (`0` disables) |
+| `DECIDE_QUEUE_TIMEOUT_S` | `60` | Pre-start queue wait deadline in seconds; expired items are evicted before GPU eval and return `503` (`0` disables). Requests already executing on GPU finish normally |
+
+- **Disconnect cancellation**: if a client closes the connection while queued, the pending item is evicted immediately (returning `499` in access logs) instead of burning GPU cycles on a dead request.
+- **Timing headers**: successful `/v1/systemone` responses include `Server-Timing: queue;dur=..., eval;dur=...`, `X-Decide-Queue-Ms`, and `X-Decide-Eval-Ms` so benchmarks and proxies can separate queue wait from GPU eval time.
 
 ## Benchmarking & Accuracy Tools
 
@@ -103,10 +129,16 @@ Standard-library-only tools are included in `tools/`:
 # Latency & throughput sweep
 DECIDE_API_KEY=... python3 tools/bench.py --url http://127.0.0.1:8000 -n 5 -c 1
 
-# Accuracy comparison against a reference FP32 server
+# Mixed short+long workload (reports short e2e p95, queue wait, and aggregate tok/s)
+DECIDE_API_KEY=... python3 tools/bench.py --url http://127.0.0.1:8000 --mixed \
+  --keys "$DECIDE_API_KEY,$KEY_USER_2" --long-concurrency 1 --short-concurrency 1 --duration 30
+
+# Accuracy comparison & regression gate against a reference FP32 server
 DECIDE_API_KEY=... python3 tools/diff_accuracy.py --record ref.json --url http://<fp32-host>:8000
-DECIDE_API_KEY=... python3 tools/diff_accuracy.py --compare ref.json --url http://127.0.0.1:8000
+DECIDE_API_KEY=... python3 tools/diff_accuracy.py --compare ref.json --url http://127.0.0.1:8000 --check
 ```
+
+`tools/diff_accuracy.py` includes 24 EN/ZH regression cases spanning near-tie `choice`, near-0.5 `noul`, `score` argmax/rounding boundaries (`SUFFICIENCY_LEVELS`, `CUT_LEVELS`), Hindsight's 5-option page-impact gate, 24-question multi-slot requests, and `11k–14k` long-context stress cases. Pass `--check` to exit non-zero on non-borderline decision flips or excessive probability/score drift (use `--max-tier-tokens 8000` when recording against an 8k-window reference server).
 
 ## License
 

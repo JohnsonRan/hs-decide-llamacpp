@@ -1,4 +1,4 @@
-# Default deployment: single llama.cpp Q8_0 instance (~2.4 GB VRAM at ctx=16384) with multi-key fair round-robin queue.
+# Default deployment: single llama.cpp Q8_0 instance (~2.1 GiB VRAM at ctx=16384) with multi-key fair round-robin queue.
 name: hs-decide-llamacpp
 
 x-logging: &default-logging
@@ -36,6 +36,9 @@ services:
       DECIDE_GPU_LAYERS: ${DECIDE_GPU_LAYERS:--1}
       DECIDE_THREADS: ${DECIDE_THREADS:-4}
       DECIDE_FLASH_ATTN: ${DECIDE_FLASH_ATTN:-auto}
+      DECIDE_MAX_QUEUE_SIZE: ${DECIDE_MAX_QUEUE_SIZE:-32}
+      DECIDE_MAX_QUEUE_PER_KEY: ${DECIDE_MAX_QUEUE_PER_KEY:-16}
+      DECIDE_QUEUE_TIMEOUT_S: ${DECIDE_QUEUE_TIMEOUT_S:-60}
       DECIDE_LOG_SLOW_MS: ${DECIDE_LOG_SLOW_MS:-1000}
       DECIDE_LOG_COLOR: ${DECIDE_LOG_COLOR:-always}
     healthcheck:

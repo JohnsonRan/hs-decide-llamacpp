@@ -159,20 +159,61 @@ def match_tenant(auth_header: str, keys: list[str]) -> str | None:
     return matched
 
 
-@dataclass
+class QueueRejectedError(Exception):
+    """Raised when the fair queue rejects a request because global or per-key capacity is full."""
+
+    def __init__(
+        self,
+        status_code: int,
+        error: str,
+        detail: str,
+        log_tag: str,
+        retry_after: int = 2,
+    ) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.error = error
+        self.detail = detail
+        self.log_tag = log_tag
+        self.retry_after = retry_after
+
+
+class QueueTimeoutError(Exception):
+    """Raised when a queued request exceeds its pre-start queue wait deadline."""
+
+    def __init__(self, detail: str, retry_after: int = 5) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.retry_after = retry_after
+
+
+class ClientDisconnectedError(Exception):
+    """Raised when the HTTP client closes the connection while queued or running."""
+
+
+@dataclass(eq=False)
 class PendingItem:
     request: Any
     rendered: Any
     future: asyncio.Future[dict[str, Any]]
-    tenant_id: str = "anon"
     enqueued_at: float = 0.0
+    deadline: float | None = None
+    started: bool = False
+    cancelled: bool = False
+    started_event: asyncio.Event | None = None
     metrics: RequestMetrics | None = None
 
 
 class FairQueue:
-    """Per-tenant FIFO queues drained in round-robin order so one key cannot starve others."""
+    """Per-tenant FIFO queues drained in round-robin order with bounded capacity and expiry."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_size: int = 0, max_per_key: int = 0) -> None:
+        if max_size < 0 or max_per_key < 0:
+            raise ValueError(
+                f"max_size ({max_size}) and max_per_key ({max_per_key}) must be >= 0"
+            )
+        self.max_size = max_size
+        self.max_per_key = max_per_key
         self._queues: dict[str, deque[PendingItem]] = {}
         self._ring: deque[str] = deque()
         self._in_ring: set[str] = set()
@@ -180,7 +221,98 @@ class FairQueue:
     def total_pending(self) -> int:
         return sum(len(q) for q in self._queues.values())
 
-    def push(self, tenant_id: str, item: PendingItem) -> None:
+    def tenant_pending(self, tenant_id: str) -> int:
+        return len(self._queues.get(tenant_id, ()))
+
+    def _drop_empty_tenant(self, tenant_id: str) -> None:
+        if self._queues.get(tenant_id):
+            return
+        self._queues.pop(tenant_id, None)
+        if tenant_id in self._in_ring:
+            self._in_ring.discard(tenant_id)
+            try:
+                self._ring.remove(tenant_id)
+            except ValueError:
+                pass
+
+    @staticmethod
+    def _is_expired(item: PendingItem, now: float | None) -> bool:
+        return now is not None and item.deadline is not None and now >= item.deadline
+
+    @staticmethod
+    def _expire_item(item: PendingItem, now: float) -> None:
+        item.cancelled = True
+        if not item.future.done():
+            waited = max(0.0, now - item.enqueued_at) if item.enqueued_at > 0 else 0.0
+            item.future.set_exception(
+                QueueTimeoutError(f"Request expired after waiting {waited:.1f}s in queue")
+            )
+        if item.started_event is not None:
+            item.started_event.set()
+
+    def prune(self, now: float | None = None) -> int:
+        """Drop cancelled, done, or expired queued items so dead entries cannot occupy slots."""
+        removed = 0
+        for tid in list(self._queues.keys()):
+            q = self._queues[tid]
+            kept: deque[PendingItem] = deque()
+            while q:
+                item = q.popleft()
+                if item.cancelled or item.future.done():
+                    removed += 1
+                    continue
+                if self._is_expired(item, now):
+                    assert now is not None
+                    self._expire_item(item, now)
+                    removed += 1
+                    continue
+                kept.append(item)
+            if kept:
+                self._queues[tid] = kept
+            else:
+                self._drop_empty_tenant(tid)
+        return removed
+
+    def remove(self, tenant_id: str, item: PendingItem) -> bool:
+        """Remove a specific pending item by identity if still queued."""
+        q = self._queues.get(tenant_id)
+        if not q:
+            return False
+        try:
+            q.remove(item)
+        except ValueError:
+            return False
+        if not q:
+            self._drop_empty_tenant(tenant_id)
+        return True
+
+    def check_capacity(self, tenant_id: str, now: float | None = None) -> QueueRejectedError | None:
+        """Prune dead items and return a QueueRejectedError if per-key or global limit is full."""
+        self.prune(now)
+        per_key = self.tenant_pending(tenant_id)
+        if self.max_per_key > 0 and per_key >= self.max_per_key:
+            return QueueRejectedError(
+                429,
+                "too_many_requests",
+                f"Per-key queue limit reached ({per_key}/{self.max_per_key})",
+                "queue_full(key)",
+                retry_after=2,
+            )
+        total = self.total_pending()
+        if self.max_size > 0 and total >= self.max_size:
+            return QueueRejectedError(
+                503,
+                "server_busy",
+                f"Global queue limit reached ({total}/{self.max_size})",
+                "queue_full(global)",
+                retry_after=2,
+            )
+        return None
+
+    def push(self, tenant_id: str, item: PendingItem, now: float | None = None) -> None:
+        err = self.check_capacity(tenant_id, now=now)
+        if err is not None:
+            raise err
         q = self._queues.get(tenant_id)
         if q is None:
             q = deque()
@@ -201,24 +333,34 @@ class FairQueue:
         self._in_ring.add(tenant_id)
         self._ring.appendleft(tenant_id)
 
-    def pop_next(self) -> tuple[str, PendingItem] | None:
+    def _drop_dead_head(self, q: deque[PendingItem], now: float | None) -> None:
+        while q:
+            head = q[0]
+            if head.cancelled or head.future.done():
+                q.popleft()
+                continue
+            if self._is_expired(head, now):
+                q.popleft()
+                assert now is not None
+                self._expire_item(head, now)
+                continue
+            return
+
+    def pop_next(self, now: float | None = None) -> tuple[str, PendingItem] | None:
         while self._ring:
             tid = self._ring.popleft()
             q = self._queues.get(tid)
-            while q and q[0].future.cancelled():
-                q.popleft()
+            if q is not None:
+                self._drop_dead_head(q, now)
             if not q:
-                self._queues.pop(tid, None)
-                self._in_ring.discard(tid)
+                self._drop_empty_tenant(tid)
                 continue
             item = q.popleft()
-            while q and q[0].future.cancelled():
-                q.popleft()
+            self._drop_dead_head(q, now)
             if q:
                 self._ring.append(tid)
             else:
-                self._queues.pop(tid, None)
-                self._in_ring.discard(tid)
+                self._drop_empty_tenant(tid)
             return tid, item
         return None
 
@@ -453,8 +595,16 @@ def create_app(
     batch_wait_ms: int,
     slow_ms: int = 1000,
     use_color: bool = True,
+    max_queue_size: int = 32,
+    max_queue_per_key: int = 16,
+    queue_timeout_s: float = 60.0,
 ) -> Any:
-    from fastapi import FastAPI, Request
+    if max_queue_size < 0 or max_queue_per_key < 0 or queue_timeout_s < 0:
+        raise ValueError(
+            f"max_queue_size ({max_queue_size}), max_queue_per_key ({max_queue_per_key}), "
+            f"and queue_timeout_s ({queue_timeout_s}) must be >= 0"
+        )
+    from fastapi import FastAPI, Request, Response
     from fastapi.responses import JSONResponse
     from hindsight_decision import schema
     from hindsight_decision.endpoint import answer_body
@@ -465,7 +615,7 @@ def create_app(
     served = identity(model, decider.folder, revision)
     engine_str = decider.engine_version()
 
-    fair_q = FairQueue()
+    fair_q = FairQueue(max_size=max_queue_size, max_per_key=max_queue_per_key)
     cond = asyncio.Condition()
     stop_flag = False
     req_log = setup_request_logger()
@@ -478,9 +628,14 @@ def create_app(
                 if stop_flag and fair_q.total_pending() == 0:
                     return
 
-                if decider.max_batch_size > 1 and batch_wait_ms > 0 and fair_q.total_pending() < decider.max_batch_size:
+                if (
+                    decider.max_batch_size > 1
+                    and batch_wait_ms > 0
+                    and not stop_flag
+                    and fair_q.total_pending() < decider.max_batch_size
+                ):
                     deadline = time.monotonic() + (batch_wait_ms / 1000.0)
-                    while fair_q.total_pending() < decider.max_batch_size:
+                    while not stop_flag and fair_q.total_pending() < decider.max_batch_size:
                         rem = deadline - time.monotonic()
                         if rem <= 0:
                             break
@@ -489,11 +644,12 @@ def create_app(
                         except asyncio.TimeoutError:
                             break
 
+                now = time.monotonic()
                 batch: list[PendingItem] = []
                 batch_tokens = 0
                 batch_slots = 0
                 while len(batch) < decider.max_batch_size:
-                    popped = fair_q.pop_next()
+                    popped = fair_q.pop_next(now=now)
                     if popped is None:
                         break
                     tid, nxt = popped
@@ -508,6 +664,11 @@ def create_app(
                     batch.append(nxt)
                     batch_tokens += t
                     batch_slots += s
+
+                for item in batch:
+                    item.started = True
+                    if item.started_event is not None:
+                        item.started_event.set()
 
             if not batch:
                 continue
@@ -562,70 +723,17 @@ def create_app(
         path = raw_request.url.path
         given = raw_request.headers.get("authorization", "")
         tenant = match_tenant(given, api_keys)
-        if tenant is None:
-            resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
+        def _log(
+            status: int,
+            tid: str,
+            used_metrics: RequestMetrics | None = None,
+            error: str | None = None,
+        ) -> None:
             req_log.info(
                 format_request_log(
                     time.strftime("%m-%d %H:%M:%S"),
-                    401,
-                    "-",
-                    client_ip,
-                    method,
-                    path,
-                    (time.monotonic() - t_req0) * 1000.0,
-                    None,
-                    slow_ms,
-                    use_color,
-                )
-            )
-            return resp
-        raw_request.state.tenant_id = tenant
-        raw_request.state.metrics = None
-        try:
-            resp = await call_next(raw_request)
-        except asyncio.CancelledError:
-            req_log.info(
-                format_request_log(
-                    time.strftime("%m-%d %H:%M:%S"),
-                    499,
-                    tenant,
-                    client_ip,
-                    method,
-                    path,
-                    (time.monotonic() - t_req0) * 1000.0,
-                    None,
-                    slow_ms,
-                    use_color,
-                    error="cancelled",
-                )
-            )
-            raise
-        except Exception as exc:
-            req_log.info(
-                format_request_log(
-                    time.strftime("%m-%d %H:%M:%S"),
-                    500,
-                    tenant,
-                    client_ip,
-                    method,
-                    path,
-                    (time.monotonic() - t_req0) * 1000.0,
-                    None,
-                    slow_ms,
-                    use_color,
-                    error=type(exc).__name__,
-                )
-            )
-            raise
-        resp.headers.update(served.headers())
-        if not (path == "/health" and resp.status_code == 200):
-            m = getattr(raw_request.state, "metrics", None)
-            used_metrics = m if (isinstance(m, RequestMetrics) and m.tokens > 0) else None
-            req_log.info(
-                format_request_log(
-                    time.strftime("%m-%d %H:%M:%S"),
-                    resp.status_code,
-                    tenant,
+                    status,
+                    tid,
                     client_ip,
                     method,
                     path,
@@ -633,40 +741,213 @@ def create_app(
                     used_metrics,
                     slow_ms,
                     use_color,
+                    error=error,
                 )
+            )
+
+        if tenant is None:
+            resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
+            _log(401, "-")
+            return resp
+        raw_request.state.tenant_id = tenant
+        raw_request.state.metrics = None
+        raw_request.state.error = None
+        try:
+            resp = await call_next(raw_request)
+        except asyncio.CancelledError:
+            _log(499, tenant, error="cancelled")
+            raise
+        except Exception as exc:
+            _log(500, tenant, error=type(exc).__name__)
+            raise
+        resp.headers.update(served.headers())
+        m = getattr(raw_request.state, "metrics", None)
+        used_metrics = m if (isinstance(m, RequestMetrics) and m.tokens > 0) else None
+        if used_metrics is not None:
+            resp.headers["Server-Timing"] = (
+                f"queue;dur={used_metrics.wait_ms:.2f}, eval;dur={used_metrics.eval_ms:.2f}"
+            )
+            resp.headers["X-Decide-Queue-Ms"] = f"{used_metrics.wait_ms:.2f}"
+            resp.headers["X-Decide-Eval-Ms"] = f"{used_metrics.eval_ms:.2f}"
+        if not (path == "/health" and resp.status_code == 200):
+            _log(
+                resp.status_code,
+                tenant,
+                used_metrics=used_metrics,
+                error=getattr(raw_request.state, "error", None),
             )
         return resp
 
-    async def respond_for(request: Any, tenant_id: str, metrics: RequestMetrics) -> dict[str, Any]:
+    def _cancel_future(fut: asyncio.Future[dict[str, Any]]) -> None:
+        if not fut.done():
+            fut.cancel()
+        elif not fut.cancelled():
+            _ = fut.exception()
+
+    def _is_succeeded(fut: asyncio.Future[dict[str, Any]]) -> bool:
+        return fut.done() and not fut.cancelled() and fut.exception() is None
+
+    def _shutting_down_error() -> QueueRejectedError:
+        return QueueRejectedError(
+            503,
+            "server_busy",
+            "Server is shutting down",
+            "shutting_down",
+            retry_after=2,
+        )
+
+    def _check_accept_locked(tenant_id: str, now: float) -> QueueRejectedError | None:
+        if stop_flag:
+            return _shutting_down_error()
+        return fair_q.check_capacity(tenant_id, now=now)
+
+    async def respond_for(
+        raw_request: Request,
+        request: Any,
+        tenant_id: str,
+        metrics: RequestMetrics,
+    ) -> dict[str, Any]:
+        async with cond:
+            early_err = _check_accept_locked(tenant_id, time.monotonic())
+        if early_err is not None:
+            raise early_err
+
         rendered = render_request(decider.tokenizer, request, decider.settings)
         limit = min(decider.max_batch_tokens, decider.ctx_size)
         if rendered.tokens() > limit:
             raise schema.ContextOverflow(
                 f"{rendered.tokens()} tokens is over this server's limit of {limit} tokens"
             )
+
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        started_event = asyncio.Event()
+        disconnected = asyncio.Event()
+
+        async def _watch_disconnect() -> None:
+            try:
+                while not disconnected.is_set():
+                    msg = await raw_request.receive()
+                    if msg.get("type") == "http.disconnect":
+                        disconnected.set()
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+
+        enqueued_at = time.monotonic()
+        deadline = enqueued_at + queue_timeout_s if queue_timeout_s > 0 else None
+        item = PendingItem(
+            request=request,
+            rendered=rendered,
+            future=fut,
+            enqueued_at=enqueued_at,
+            deadline=deadline,
+            started_event=started_event,
+            metrics=metrics,
+        )
         async with cond:
-            fair_q.push(
-                tenant_id,
-                PendingItem(
-                    request=request,
-                    rendered=rendered,
-                    future=fut,
-                    tenant_id=tenant_id,
-                    enqueued_at=time.monotonic(),
-                    metrics=metrics,
-                ),
-            )
+            if stop_flag:
+                raise _shutting_down_error()
+            fair_q.push(tenant_id, item, now=enqueued_at)
             cond.notify()
-        return await asyncio.shield(fut)
+
+        disc_task = asyncio.create_task(_watch_disconnect())
+        start_wait = asyncio.create_task(started_event.wait())
+        disc_wait = asyncio.create_task(disconnected.wait())
+        try:
+            # Phase 1: queued (bounded by queue_timeout_s and pre-start disconnect cancellation).
+            while not item.started and not fut.done() and not disconnected.is_set():
+                rem = None
+                if deadline is not None:
+                    rem = max(0.0, deadline - time.monotonic())
+                    if rem <= 0.0:
+                        break
+                done, _ = await asyncio.wait(
+                    {start_wait, disc_wait, fut},
+                    timeout=rem,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    break
+
+            if disconnected.is_set() and not _is_succeeded(fut):
+                async with cond:
+                    if not item.started:
+                        item.cancelled = True
+                        fair_q.remove(tenant_id, item)
+                _cancel_future(fut)
+                raise ClientDisconnectedError()
+
+            if not item.started and not fut.done():
+                async with cond:
+                    if not item.started and not fut.done():
+                        item.cancelled = True
+                        fair_q.remove(tenant_id, item)
+                        fut.cancel()
+                        raise QueueTimeoutError(
+                            f"Request expired after waiting >{queue_timeout_s:g}s in queue"
+                        )
+
+            if fut.done():
+                return await fut
+
+            # Phase 2: inference has started; let GPU work finish unless the client disconnects.
+            while not fut.done() and not disconnected.is_set():
+                await asyncio.wait({fut, disc_wait}, return_when=asyncio.FIRST_COMPLETED)
+
+            if disconnected.is_set() and not _is_succeeded(fut):
+                _cancel_future(fut)
+                raise ClientDisconnectedError()
+
+            return await fut
+        except asyncio.CancelledError:
+            item.cancelled = True
+            _cancel_future(fut)
+            async with cond:
+                if not item.started:
+                    fair_q.remove(tenant_id, item)
+            raise
+        finally:
+            for task in (start_wait, disc_wait, disc_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(start_wait, disc_wait, disc_task, return_exceptions=True)
 
     @server.post("/v1/systemone")
     async def systemone(raw_request: Request) -> Any:
         tenant_id = getattr(raw_request.state, "tenant_id", "anon")
         metrics = RequestMetrics()
         raw_request.state.metrics = metrics
-        return await answer_body(raw_request, lambda req: respond_for(req, tenant_id, metrics))
+        try:
+            async with cond:
+                early_err = _check_accept_locked(tenant_id, time.monotonic())
+            if early_err is not None:
+                raise early_err
+            return await answer_body(
+                raw_request, lambda req: respond_for(raw_request, req, tenant_id, metrics)
+            )
+        except QueueRejectedError as exc:
+            raw_request.state.metrics = None
+            raw_request.state.error = exc.log_tag
+            return JSONResponse(
+                {"error": exc.error, "detail": exc.detail},
+                status_code=exc.status_code,
+                headers={"Retry-After": str(exc.retry_after)},
+            )
+        except QueueTimeoutError as exc:
+            raw_request.state.metrics = None
+            raw_request.state.error = "queue_timeout"
+            return JSONResponse(
+                {"error": "queue_timeout", "detail": exc.detail},
+                status_code=503,
+                headers={"Retry-After": str(exc.retry_after)},
+            )
+        except ClientDisconnectedError:
+            raw_request.state.metrics = None
+            raw_request.state.error = "cancelled"
+            return Response(status_code=499)
 
     @server.get("/v1/models")
     async def models() -> Any:
@@ -695,6 +976,10 @@ def create_app(
     return server
 
 
+def _env_default(name: str, default: str, cast: Any) -> Any:
+    return cast((os.environ.get(name) or "").strip() or default)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog=SERVER)
     parser.add_argument("model_dir")
@@ -715,11 +1000,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gpu-layers", type=int, default=-1)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--flash-attn", choices=["auto", "on", "off"], default="auto")
-    parser.add_argument(
-        "--slow-ms",
-        type=int,
-        default=int((os.environ.get("DECIDE_LOG_SLOW_MS") or "").strip() or "1000"),
-    )
+    parser.add_argument("--max-queue-size", type=int, default=_env_default("DECIDE_MAX_QUEUE_SIZE", "32", int))
+    parser.add_argument("--max-queue-per-key", type=int, default=_env_default("DECIDE_MAX_QUEUE_PER_KEY", "16", int))
+    parser.add_argument("--queue-timeout-s", type=float, default=_env_default("DECIDE_QUEUE_TIMEOUT_S", "60", float))
+    parser.add_argument("--slow-ms", type=int, default=_env_default("DECIDE_LOG_SLOW_MS", "1000", int))
     parser.add_argument(
         "--log-color",
         choices=["always", "auto", "never"],
@@ -747,7 +1031,12 @@ def main(argv: list[str] | None = None) -> None:
         threads=args.threads,
         flash_attn=args.flash_attn,
     )
-    print(f"Serving {args.gguf} ({decider.engine_version()}, keys={len(api_keys)})", flush=True)
+    print(
+        f"Serving {args.gguf} ({decider.engine_version()}, keys={len(api_keys)}, "
+        f"queue={args.max_queue_size}, per_key={args.max_queue_per_key}, "
+        f"queue_timeout={args.queue_timeout_s:g}s)",
+        flush=True,
+    )
     uvicorn.run(
         create_app(
             decider,
@@ -757,6 +1046,9 @@ def main(argv: list[str] | None = None) -> None:
             args.batch_wait_ms,
             slow_ms=args.slow_ms,
             use_color=resolve_log_color(args.log_color),
+            max_queue_size=args.max_queue_size,
+            max_queue_per_key=args.max_queue_per_key,
+            queue_timeout_s=args.queue_timeout_s,
         ),
         host=args.host,
         port=args.port,
