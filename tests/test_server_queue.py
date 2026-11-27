@@ -397,14 +397,19 @@ def test_timing_headers_and_429_503_limits(monkeypatch: pytest.MonkeyPatch):
             for t in threads:
                 t.join(timeout=5.0)
 
+        batch_ids: set[str] = set()
         for name in ("blocker", "q_k0", "q_k1"):
             st, hdr, data = results[name]
             assert st == 200
             assert "x-decide-queue-ms" in hdr
             assert "x-decide-eval-ms" in hdr
+            assert hdr.get("x-decide-batch-size") == "1"
+            assert "x-decide-batch-id" in hdr and int(hdr["x-decide-batch-id"]) >= 1
+            batch_ids.add(hdr["x-decide-batch-id"])
             assert "queue;dur=" in hdr["server-timing"]
             assert "eval;dur=" in hdr["server-timing"]
             assert data["tag"] == name
+        assert len(batch_ids) == 3
 
 
 def test_queue_timeout_evicts_pre_start_but_never_aborts_started(monkeypatch: pytest.MonkeyPatch):
@@ -647,10 +652,15 @@ def test_phase2_disconnect_eval_error_500_and_error_headers(monkeypatch: pytest.
     )
 
     with _running_uvicorn(app, "k0") as port:
-        # 1. 401 unauthorized carries no timing headers
+        # 1. 401 unauthorized carries no timing or batch headers
         st_401, hdr_401, _ = _post_systemone(port, "wrong", "unauth")
         assert st_401 == 401
-        assert "server-timing" not in hdr_401 and "x-decide-queue-ms" not in hdr_401
+        assert (
+            "server-timing" not in hdr_401
+            and "x-decide-queue-ms" not in hdr_401
+            and "x-decide-batch-size" not in hdr_401
+            and "x-decide-batch-id" not in hdr_401
+        )
 
         # 2. Client disconnects AFTER GPU eval starts (Phase 2)
         sock = _open_raw_post(port, "k0", "mid_gpu")
@@ -666,7 +676,12 @@ def test_phase2_disconnect_eval_error_500_and_error_headers(monkeypatch: pytest.
         monkeypatch.setattr(decider, "eval_batch", boom)
         st_500, hdr_500, _ = _post_systemone(port, "k0", "boom")
         assert st_500 == 500
-        assert "server-timing" not in hdr_500 and "x-decide-queue-ms" not in hdr_500
+        assert (
+            "server-timing" not in hdr_500
+            and "x-decide-queue-ms" not in hdr_500
+            and "x-decide-batch-size" not in hdr_500
+            and "x-decide-batch-id" not in hdr_500
+        )
 
 
 def test_main_env_queue_defaults(monkeypatch: pytest.MonkeyPatch):
@@ -697,3 +712,189 @@ def test_main_env_queue_defaults(monkeypatch: pytest.MonkeyPatch):
     assert captured["kwargs"]["max_queue_size"] == 48
     assert captured["kwargs"]["max_queue_per_key"] == 12
     assert captured["kwargs"]["queue_timeout_s"] == 45.5
+
+
+def test_batch_headers_multi_seq_and_serial_fallback(monkeypatch: pytest.MonkeyPatch, capsys):
+    render_calls: list[str] = []
+    _install_fake_hindsight_decision(monkeypatch, render_calls)
+
+    # Part A: real multi-sequence batch shares batch_id and reports batch_size=2
+    decider = _FakeDecider()
+    decider.max_batch_size = 4
+    blocker_started, release_blocker = decider.arm("blocker")
+    app = srv.create_app(
+        decider,
+        "hs-decide-1-flash",
+        None,
+        ["k0"],
+        batch_wait_ms=0,
+        use_color=False,
+        max_queue_size=10,
+        max_queue_per_key=10,
+        queue_timeout_s=10.0,
+    )
+
+    with _running_uvicorn(app, "k0") as port:
+        results = {}
+        threads = []
+        t_b = threading.Thread(target=lambda: results.__setitem__("blocker", _post_systemone(port, "k0", "blocker", tokens=100)))
+        t_b.start()
+        threads.append(t_b)
+        assert blocker_started.wait(timeout=3.0)
+
+        for tag, toks in [("req_short", 100), ("req_long", 400)]:
+            t = threading.Thread(
+                target=lambda tg=tag, tk=toks: results.__setitem__(tg, _post_systemone(port, "k0", tg, tokens=tk))
+            )
+            t.start()
+            threads.append(t)
+            _wait_rendered(render_calls, tag)
+
+        release_blocker.set()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        st_b, hdr_b, _ = results["blocker"]
+        st_s, hdr_s, data_s = results["req_short"]
+        st_l, hdr_l, data_l = results["req_long"]
+        assert (st_b, st_s, st_l) == (200, 200, 200)
+        assert hdr_b["x-decide-batch-size"] == "1"
+        assert hdr_s["x-decide-batch-size"] == "2"
+        assert hdr_l["x-decide-batch-size"] == "2"
+        assert hdr_s["x-decide-batch-id"] == hdr_l["x-decide-batch-id"]
+        assert hdr_s["x-decide-batch-id"] != hdr_b["x-decide-batch-id"]
+        assert data_s["tag"] == "req_short" and data_l["tag"] == "req_long"
+
+    # Drain Part A stdout before Part B fallback check
+    capsys.readouterr()
+
+    # Part B: real LlamaCppDecider.eval_batch serial fallback must report batch_size=1 & distinct batch_ids
+    render_calls.clear()
+    fb_decider = object.__new__(srv.LlamaCppDecider)
+    fb_decider.folder = Path(".")
+    fb_decider.settings = types.SimpleNamespace(max_request_tokens=16384)
+    fb_decider.tokenizer = None
+    fb_decider.ids = [1, 2]
+    fb_decider.ctx_size = 16384
+    fb_decider.max_batch_tokens = 16384
+    fb_decider.max_batch_size = 4
+    fb_decider.max_outputs = 256
+    fb_decider.device_label = "cpu"
+    fb_decider.last_batch_fell_back = False
+
+    fb_started = threading.Event()
+    fb_release = threading.Event()
+    multi_attempts: list[list[str]] = []
+    serial_evals: list[str] = []
+
+    def fake_eval_once(rendered_list):
+        if len(rendered_list) > 1:
+            multi_attempts.append([r.tag for r in rendered_list])
+            raise RuntimeError("simulated multi-seq eval failure")
+        item = rendered_list[0]
+        serial_evals.append(item.tag)
+        if item.tag == "fb_blocker":
+            fb_started.set()
+            fb_release.wait(timeout=10.0)
+        return [[[0.0, 1.0] for _ in item.questions]]
+
+    fb_decider._eval_once = fake_eval_once
+
+    fb_app = srv.create_app(
+        fb_decider,
+        "hs-decide-1-flash",
+        None,
+        ["k0"],
+        batch_wait_ms=0,
+        use_color=False,
+        max_queue_size=10,
+        max_queue_per_key=10,
+        queue_timeout_s=10.0,
+    )
+
+    with _running_uvicorn(fb_app, "k0") as port:
+        fb_results = {}
+        fb_threads = []
+        t_b = threading.Thread(
+            target=lambda: fb_results.__setitem__("fb_blocker", _post_systemone(port, "k0", "fb_blocker", tokens=100))
+        )
+        t_b.start()
+        fb_threads.append(t_b)
+        assert fb_started.wait(timeout=3.0)
+
+        for tag, toks in [("fb_short", 100), ("fb_long", 400)]:
+            t = threading.Thread(
+                target=lambda tg=tag, tk=toks: fb_results.__setitem__(tg, _post_systemone(port, "k0", tg, tokens=tk))
+            )
+            t.start()
+            fb_threads.append(t)
+            _wait_rendered(render_calls, tag)
+
+        fb_release.set()
+        for t in fb_threads:
+            t.join(timeout=5.0)
+
+        assert len(multi_attempts) == 1
+        assert set(multi_attempts[0]) == {"fb_short", "fb_long"}
+        assert serial_evals == ["fb_blocker", "fb_short", "fb_long"]
+
+        st_fs, hdr_fs, _ = fb_results["fb_short"]
+        st_fl, hdr_fl, _ = fb_results["fb_long"]
+        assert st_fs == 200 and st_fl == 200
+        assert hdr_fs["x-decide-batch-size"] == "1"
+        assert hdr_fl["x-decide-batch-size"] == "1"
+        assert hdr_fs["x-decide-batch-id"] != hdr_fl["x-decide-batch-id"]
+
+    captured = capsys.readouterr().out
+    assert "b=2" not in captured
+
+
+def test_batch_worker_respects_ctx_size_when_smaller_than_max_batch_tokens(monkeypatch: pytest.MonkeyPatch):
+    render_calls: list[str] = []
+    _install_fake_hindsight_decision(monkeypatch, render_calls)
+    decider = _FakeDecider()
+    decider.max_batch_size = 2
+    decider.max_batch_tokens = 1000
+    decider.ctx_size = 200
+    blocker_started, release_blocker = decider.arm("blocker")
+
+    app = srv.create_app(
+        decider,
+        "hs-decide-1-flash",
+        None,
+        ["k0"],
+        batch_wait_ms=0,
+        use_color=False,
+        max_queue_size=10,
+        max_queue_per_key=10,
+        queue_timeout_s=10.0,
+    )
+
+    with _running_uvicorn(app, "k0") as port:
+        results = {}
+        threads = []
+        t_b = threading.Thread(
+            target=lambda: results.__setitem__("blocker", _post_systemone(port, "k0", "blocker", tokens=120))
+        )
+        t_b.start()
+        threads.append(t_b)
+        assert blocker_started.wait(timeout=3.0)
+
+        for tag in ("a", "b"):
+            t = threading.Thread(
+                target=lambda tg=tag: results.__setitem__(tg, _post_systemone(port, "k0", tg, tokens=120))
+            )
+            t.start()
+            threads.append(t)
+            _wait_rendered(render_calls, tag)
+
+        release_blocker.set()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        st_a, hdr_a, _ = results["a"]
+        st_b, hdr_b, _ = results["b"]
+        assert st_a == 200 and st_b == 200
+        assert hdr_a["x-decide-batch-size"] == "1"
+        assert hdr_b["x-decide-batch-size"] == "1"
+        assert hdr_a["x-decide-batch-id"] != hdr_b["x-decide-batch-id"]

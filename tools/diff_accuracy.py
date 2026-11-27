@@ -615,7 +615,37 @@ def build_suite(max_tier_tokens=None):
     return cases
 
 
-def call_systemone(url, key, body, timeout):
+def _header_get(headers, name):
+    if headers is None:
+        return None
+    target = name.lower()
+    for k, v in headers.items():
+        if k.lower() == target:
+            return v
+    return None
+
+
+def _parse_pos_int(raw):
+    if raw is None or isinstance(raw, bool) or isinstance(raw, float):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 1 else None
+    try:
+        val = int(str(raw).strip())
+    except (ValueError, AttributeError):
+        return None
+    return val if val >= 1 else None
+
+
+def parse_batch_headers(headers):
+    """Extract (batch_size, batch_id) positive integers from X-Decide-Batch-* headers."""
+    return (
+        _parse_pos_int(_header_get(headers, "X-Decide-Batch-Size")),
+        _parse_pos_int(_header_get(headers, "X-Decide-Batch-Id")),
+    )
+
+
+def call_systemone_with_meta(url, key, body, timeout):
     req = urllib.request.Request(
         url + "/v1/systemone",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -625,10 +655,16 @@ def call_systemone(url, key, body, timeout):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
-        return time.perf_counter() - t0, data
+            bs, bid = parse_batch_headers(resp.headers)
+        return time.perf_counter() - t0, data, {"batch_size": bs, "batch_id": bid}
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:400]
         raise RuntimeError(f"HTTP {e.code} from {url}/v1/systemone: {detail}") from e
+
+
+def call_systemone(url, key, body, timeout):
+    lat, data, _ = call_systemone_with_meta(url, key, body, timeout)
+    return lat, data
 
 
 def get_json(url, key, path):
@@ -677,6 +713,210 @@ def _top_margin(probs):
     return vals[0] if vals else 1.0
 
 
+def _is_finite_number(val):
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val)
+
+
+def _validate_prob_map(label, ref_probs, cand_probs, *, require_nonempty=True):
+    if not isinstance(ref_probs, dict) or (require_nonempty and not ref_probs):
+        return f"invalid or empty reference {label} probabilities"
+    if not isinstance(cand_probs, dict) or (require_nonempty and not cand_probs):
+        return f"missing or invalid candidate {label} probabilities"
+
+    missing_keys = [k for k in ref_probs if k not in cand_probs]
+    if missing_keys:
+        return f"missing {label} probability keys {missing_keys}"
+    extra_keys = sorted(str(k) for k in cand_probs if k not in ref_probs)
+    if extra_keys:
+        return f"unexpected extra {label} probability keys {extra_keys}"
+
+    bad_ref = [str(k) for k, v in ref_probs.items() if not _is_finite_number(v)]
+    if bad_ref:
+        return f"invalid reference {label} probability value(s) for {bad_ref}"
+    bad_cand = [str(k) for k, v in cand_probs.items() if not _is_finite_number(v)]
+    if bad_cand:
+        return f"invalid candidate {label} probability value(s) for {bad_cand}"
+    return None
+
+
+def _validate_case_answers(case_name, ref_resp, cand_resp):
+    """Strictly verify question IDs, answer types, option sets, and numeric types."""
+    schema_errors = []
+    valid_pairs = []
+
+    ref_answers = ref_resp.get("answers") if isinstance(ref_resp, dict) else None
+    if not isinstance(ref_answers, dict):
+        schema_errors.append({
+            "case": case_name,
+            "qid": "*",
+            "reason": "missing or invalid reference answers map",
+        })
+        return valid_pairs, schema_errors
+
+    cand_answers = cand_resp.get("answers") if isinstance(cand_resp, dict) else None
+    if not isinstance(cand_answers, dict):
+        schema_errors.append({
+            "case": case_name,
+            "qid": "*",
+            "reason": "missing or invalid candidate answers map",
+        })
+        return valid_pairs, schema_errors
+
+    for extra_qid in sorted(str(k) for k in cand_answers if k not in ref_answers):
+        schema_errors.append({
+            "case": case_name,
+            "qid": extra_qid,
+            "reason": "unexpected extra question in candidate answers",
+        })
+
+    for qid, ref_ans in ref_answers.items():
+        if not isinstance(ref_ans, dict):
+            schema_errors.append({
+                "case": case_name,
+                "qid": qid,
+                "reason": "invalid reference answer object",
+            })
+            continue
+        if qid not in cand_answers or not isinstance(cand_answers[qid], dict):
+            schema_errors.append({
+                "case": case_name,
+                "qid": qid,
+                "reason": (
+                    "missing question in candidate answers"
+                    if qid not in cand_answers
+                    else "invalid candidate answer object"
+                ),
+            })
+            continue
+        cand_ans = cand_answers[qid]
+
+        qtype = ref_ans.get("type")
+        if qtype not in ("choice", "noul", "score"):
+            schema_errors.append({
+                "case": case_name,
+                "qid": qid,
+                "reason": f"unknown reference answer type {qtype!r}",
+            })
+            continue
+
+        cand_type = cand_ans.get("type")
+        if cand_type != qtype:
+            schema_errors.append({
+                "case": case_name,
+                "qid": qid,
+                "reason": f"answer type mismatch: expected {qtype!r}, got {cand_type!r}",
+            })
+            continue
+
+        if qtype == "choice":
+            ref_probs = ref_ans.get("probabilities")
+            cand_probs = cand_ans.get("probabilities")
+            prob_err = _validate_prob_map("choice", ref_probs, cand_probs, require_nonempty=True)
+            if prob_err is not None:
+                schema_errors.append({"case": case_name, "qid": qid, "reason": prob_err})
+                continue
+
+            ref_choice = ref_ans.get("choice")
+            cand_choice = cand_ans.get("choice")
+            if ref_choice is not None and (
+                isinstance(ref_choice, bool)
+                or not isinstance(ref_choice, (str, int))
+                or ref_choice not in ref_probs
+            ):
+                schema_errors.append({
+                    "case": case_name,
+                    "qid": qid,
+                    "reason": f"invalid reference choice {ref_choice!r}",
+                })
+                continue
+            if ref_choice is not None and cand_choice is None:
+                schema_errors.append({
+                    "case": case_name,
+                    "qid": qid,
+                    "reason": "missing candidate choice",
+                })
+                continue
+            if cand_choice is not None and (
+                isinstance(cand_choice, bool)
+                or not isinstance(cand_choice, (str, int))
+                or cand_choice not in cand_probs
+            ):
+                schema_errors.append({
+                    "case": case_name,
+                    "qid": qid,
+                    "reason": f"invalid candidate choice {cand_choice!r}",
+                })
+                continue
+        elif qtype == "noul":
+            ref_noul = ref_ans.get("noul")
+            cand_noul = cand_ans.get("noul")
+            if not _is_finite_number(ref_noul):
+                schema_errors.append({
+                    "case": case_name,
+                    "qid": qid,
+                    "reason": "missing or invalid reference noul value",
+                })
+                continue
+            if not _is_finite_number(cand_noul):
+                schema_errors.append({
+                    "case": case_name,
+                    "qid": qid,
+                    "reason": "missing noul value" if cand_noul is None else "invalid non-numeric noul value",
+                })
+                continue
+        elif qtype == "score":
+            ref_probs = ref_ans.get("probabilities")
+            cand_probs = cand_ans.get("probabilities")
+            if ref_probs is not None:
+                prob_err = _validate_prob_map("score", ref_probs, cand_probs, require_nonempty=False)
+                if prob_err is not None:
+                    schema_errors.append({"case": case_name, "qid": qid, "reason": prob_err})
+                    continue
+            elif cand_probs not in (None, {}):
+                schema_errors.append({
+                    "case": case_name,
+                    "qid": qid,
+                    "reason": "unexpected candidate score probabilities",
+                })
+                continue
+
+            ref_score = ref_ans.get("score")
+            cand_score = cand_ans.get("score")
+            if ref_score is not None:
+                if not _is_finite_number(ref_score):
+                    schema_errors.append({
+                        "case": case_name,
+                        "qid": qid,
+                        "reason": "invalid reference score value",
+                    })
+                    continue
+                if cand_score is None:
+                    schema_errors.append({
+                        "case": case_name,
+                        "qid": qid,
+                        "reason": "missing candidate score value",
+                    })
+                    continue
+                if not _is_finite_number(cand_score):
+                    schema_errors.append({
+                        "case": case_name,
+                        "qid": qid,
+                        "reason": "invalid non-numeric candidate score value",
+                    })
+                    continue
+            elif cand_score is not None and not _is_finite_number(cand_score):
+                schema_errors.append({
+                    "case": case_name,
+                    "qid": qid,
+                    "reason": "invalid non-numeric candidate score value",
+                })
+                continue
+
+        valid_pairs.append((qid, qtype, ref_ans, cand_ans))
+
+    return valid_pairs, schema_errors
+
+
 def evaluate_comparison(
     ref_cases,
     cand_results,
@@ -711,7 +951,7 @@ def evaluate_comparison(
     choice_prob_diffs = []
     tier_stats = {}
     flips = []
-    missing_errors = []
+    schema_errors = []
     ref_lats = []
     cand_lats = []
     cov_margin = max(0.05, margin_threshold)
@@ -754,49 +994,21 @@ def evaluate_comparison(
         ts["ref_lats"].append(case["latency"])
         ts["cand_lats"].append(cand_lat)
 
-        cand_answers = cand_resp.get("answers") if isinstance(cand_resp, dict) else None
-        if not isinstance(cand_answers, dict):
-            missing_errors.append({
-                "case": case["name"],
-                "qid": "*",
-                "reason": "missing or invalid candidate answers map",
-            })
-            continue
+        valid_pairs, case_errors = _validate_case_answers(case["name"], ref_resp, cand_resp)
+        schema_errors.extend(case_errors)
 
-        for qid, ref_ans in ref_resp["answers"].items():
-            cand_ans = cand_answers.get(qid)
-            if not isinstance(cand_ans, dict):
-                missing_errors.append({
-                    "case": case["name"],
-                    "qid": qid,
-                    "reason": "missing question in candidate answers",
-                })
-                continue
-            qtype = ref_ans["type"]
+        for qid, qtype, ref_ans, cand_ans in valid_pairs:
             if qtype == "choice":
                 choice_total += 1
                 ts["choice_tot"] += 1
-                ref_probs = ref_ans.get("probabilities") or {}
-                cand_probs = cand_ans.get("probabilities") or {}
+                ref_probs = ref_ans["probabilities"]
+                cand_probs = cand_ans["probabilities"]
                 ref_choice = ref_ans.get("choice")
-                if ref_choice is None and ref_probs:
+                if ref_choice is None:
                     ref_choice = max(ref_probs, key=lambda k: ref_probs[k])
                 cand_choice = cand_ans.get("choice")
-                if cand_choice is None and cand_probs:
+                if cand_choice is None:
                     cand_choice = max(cand_probs, key=lambda k: cand_probs[k])
-
-                missing_keys = [k for k in ref_probs if k not in cand_probs or cand_probs[k] is None]
-                if missing_keys or cand_choice is None:
-                    missing_errors.append({
-                        "case": case["name"],
-                        "qid": qid,
-                        "reason": (
-                            f"missing choice probability keys {missing_keys}"
-                            if missing_keys
-                            else "missing candidate choice"
-                        ),
-                    })
-                    continue
 
                 q_diffs = []
                 for k, rp in ref_probs.items():
@@ -805,28 +1017,21 @@ def evaluate_comparison(
                     ts["prob_diffs"].append(d)
                     q_diffs.append(d)
                 margin = _top_margin(ref_probs)
-                q_max_diff = max(q_diffs) if q_diffs else 0.0
-                track_boundary(margin, q_max_diff if q_diffs else None)
+                q_max_diff = max(q_diffs)
+                track_boundary(margin, q_max_diff)
                 if ref_choice == cand_choice:
                     choice_match += 1
                     ts["choice_ok"] += 1
                 else:
                     record_flip(
                         case["name"], tier, qid, "choice",
-                        str(ref_choice), ref_probs.get(ref_choice, 0.0) if ref_choice is not None else 0.0,
-                        str(cand_choice), cand_probs.get(cand_choice, 0.0) if cand_choice is not None else 0.0,
+                        str(ref_choice), ref_probs.get(ref_choice, 0.0),
+                        str(cand_choice), cand_probs.get(cand_choice, 0.0),
                         margin, q_max_diff,
                     )
             elif qtype == "noul":
-                ref_noul = ref_ans.get("noul")
-                cand_noul = cand_ans.get("noul")
-                if ref_noul is None or cand_noul is None:
-                    missing_errors.append({
-                        "case": case["name"],
-                        "qid": qid,
-                        "reason": "missing noul value",
-                    })
-                    continue
+                ref_noul = ref_ans["noul"]
+                cand_noul = cand_ans["noul"]
                 noul_total += 1
                 d = abs(ref_noul - cand_noul)
                 noul_diffs.append(d)
@@ -846,14 +1051,6 @@ def evaluate_comparison(
             elif qtype == "score":
                 ref_probs = ref_ans.get("probabilities") or {}
                 cand_probs = cand_ans.get("probabilities") or {}
-                missing_keys = [k for k in ref_probs if k not in cand_probs or cand_probs[k] is None]
-                if ref_probs and missing_keys:
-                    missing_errors.append({
-                        "case": case["name"],
-                        "qid": qid,
-                        "reason": f"missing score probability keys {missing_keys}",
-                    })
-                    continue
 
                 q_diffs = []
                 for k, rp in ref_probs.items():
@@ -868,7 +1065,7 @@ def evaluate_comparison(
                     ref_top = max(ref_probs, key=lambda k: ref_probs[k])
                     cand_top = max(cand_probs, key=lambda k: cand_probs[k])
                     margin = _top_margin(ref_probs)
-                    track_boundary(margin, q_max_diff if q_diffs else None)
+                    track_boundary(margin, q_max_diff)
                     if ref_top == cand_top:
                         score_argmax_match += 1
                     else:
@@ -882,13 +1079,6 @@ def evaluate_comparison(
 
                 ref_score = ref_ans.get("score")
                 cand_score = cand_ans.get("score")
-                if ref_score is not None and cand_score is None:
-                    missing_errors.append({
-                        "case": case["name"],
-                        "qid": qid,
-                        "reason": "missing candidate score value",
-                    })
-                    continue
                 if ref_score is not None and cand_score is not None:
                     score_diffs.append(abs(ref_score - cand_score))
                     score_round_total += 1
@@ -916,10 +1106,10 @@ def evaluate_comparison(
 
     checks = [
         {
-            "name": "missing_errors",
-            "actual": len(missing_errors),
+            "name": "schema_errors",
+            "actual": len(schema_errors),
             "limit": 0,
-            "passed": len(missing_errors) == 0,
+            "passed": len(schema_errors) == 0,
         },
         {
             "name": "hard_flips",
@@ -1017,7 +1207,8 @@ def evaluate_comparison(
             "cand_sum": sum(cand_lats),
         },
         "tiers": tier_rows,
-        "missing_errors": missing_errors,
+        "schema_errors": schema_errors,
+        "missing_errors": schema_errors,
         "flips": flips,
         "hard_flips": hard_flips,
         "borderline_flips": borderline_flips,
@@ -1122,9 +1313,9 @@ def compare_mode(args):
             f"{ts['prob_mae']:10.5f} {ts['prob_max']:10.5f} {ts['ref_avg']:8.3f}s {ts['cand_avg']:8.3f}s {ts['speedup']:7.2f}x"
         )
 
-    if report["missing_errors"]:
-        print("\n=== Missing / Incomplete Candidate Fields ===")
-        for m in report["missing_errors"]:
+    if report["schema_errors"]:
+        print("\n=== Schema / Missing Candidate Field Errors ===")
+        for m in report["schema_errors"]:
             print(f"  {m['case']}.{m['qid']}: {m['reason']}")
     for heading, cond_str, bucket in (
         ("Hard Decision Flips", f"margin >= {args.margin_threshold:.3f}", report["hard_flips"]),
@@ -1139,7 +1330,7 @@ def compare_mode(args):
                 f"-> cand={f['cand_val']} ({f['cand_prob']:.4f}) "
                 f"[margin={f['ref_margin']:.4f}, diff={f['prob_diff']:.5f}]"
             )
-    if not report["flips"] and not report["missing_errors"]:
+    if not report["flips"] and not report["schema_errors"]:
         print("\nNo choice, noul(>=0.5), or score decision flips!")
 
     if args.json_out:
@@ -1159,6 +1350,237 @@ def compare_mode(args):
             sys.exit(1)
 
 
+def _unpack_result(entry):
+    if len(entry) == 3:
+        lat, resp, meta = entry
+        return lat, resp, (meta if isinstance(meta, dict) else {})
+    lat, resp = entry
+    return lat, resp, {}
+
+
+def evaluate_mixed_batch(
+    selected,
+    serial_results,
+    batched_results,
+    *,
+    max_prob_diff=5e-3,
+    max_score_diff=5e-3,
+    margin_threshold=0.02,
+):
+    if len(selected) != len(serial_results) or len(selected) != len(batched_results):
+        raise ValueError(
+            f"Mismatched counts: selected={len(selected)}, serial={len(serial_results)}, batched={len(batched_results)}"
+        )
+
+    schema_errors = []
+    hard_choice_flips = []
+    observed_max_prob_diff = 0.0
+    observed_max_score_diff = 0.0
+    max_prob_diff_detail = None
+    max_score_diff_detail = None
+    req_records = []
+
+    for c, s_entry, b_entry in zip(selected, serial_results, batched_results, strict=True):
+        s_lat, s_resp, _ = _unpack_result(s_entry)
+        b_lat, b_resp, b_meta = _unpack_result(b_entry)
+
+        valid_pairs, case_errors = _validate_case_answers(c["name"], s_resp, b_resp)
+        schema_errors.extend(case_errors)
+
+        for qid, qtype, s_ans, b_ans in valid_pairs:
+            if qtype == "noul":
+                diff = abs(s_ans["noul"] - b_ans["noul"])
+                if diff > observed_max_prob_diff:
+                    observed_max_prob_diff = diff
+                    max_prob_diff_detail = {
+                        "case": c["name"],
+                        "qid": qid,
+                        "key": None,
+                        "serial": s_ans["noul"],
+                        "batched": b_ans["noul"],
+                        "diff": diff,
+                    }
+            else:
+                s_probs = s_ans.get("probabilities") or {}
+                b_probs = b_ans.get("probabilities") or {}
+                for k, sp in s_probs.items():
+                    diff = abs(sp - b_probs[k])
+                    if diff > observed_max_prob_diff:
+                        observed_max_prob_diff = diff
+                        max_prob_diff_detail = {
+                            "case": c["name"],
+                            "qid": qid,
+                            "key": k,
+                            "serial": sp,
+                            "batched": b_probs[k],
+                            "diff": diff,
+                        }
+                if qtype == "choice":
+                    s_choice = s_ans.get("choice")
+                    if s_choice is None:
+                        s_choice = max(s_probs, key=lambda k: s_probs[k])
+                    b_choice = b_ans.get("choice")
+                    if b_choice is None:
+                        b_choice = max(b_probs, key=lambda k: b_probs[k])
+                    margin = _top_margin(s_probs)
+                    if s_choice != b_choice and margin >= margin_threshold:
+                        hard_choice_flips.append({
+                            "case": c["name"],
+                            "qid": qid,
+                            "serial_choice": str(s_choice),
+                            "batched_choice": str(b_choice),
+                            "margin": margin,
+                        })
+                elif qtype == "score":
+                    s_score = s_ans.get("score")
+                    b_score = b_ans.get("score")
+                    if s_score is not None and b_score is not None:
+                        s_diff = abs(s_score - b_score)
+                        if s_diff > observed_max_score_diff:
+                            observed_max_score_diff = s_diff
+                            max_score_diff_detail = {
+                                "case": c["name"],
+                                "qid": qid,
+                                "serial": s_score,
+                                "batched": b_score,
+                                "diff": s_diff,
+                            }
+
+        b_tokens = (b_resp.get("usage") or {}).get("input_tokens") if isinstance(b_resp, dict) else None
+        s_tokens = (s_resp.get("usage") or {}).get("input_tokens") if isinstance(s_resp, dict) else None
+        tokens = _parse_pos_int(b_tokens)
+        if tokens is None:
+            tokens = _parse_pos_int(s_tokens)
+
+        req_records.append({
+            "case": c["name"],
+            "tokens": tokens,
+            "serial_lat": s_lat,
+            "batched_lat": b_lat,
+            "batch_size": _parse_pos_int(b_meta.get("batch_size")),
+            "batch_id": _parse_pos_int(b_meta.get("batch_id")),
+        })
+
+    observed_batches = []
+    mixed_batches = []
+    batch_id_inferred = False
+    coverage_reason = None
+
+    missing_batch_headers = [r["case"] for r in req_records if r["batch_size"] is None]
+    if missing_batch_headers:
+        covered = False
+        coverage_reason = f"missing X-Decide-Batch-Size header on {missing_batch_headers}"
+    elif all(r["batch_id"] is not None for r in req_records):
+        groups = {}
+        for r in req_records:
+            groups.setdefault(r["batch_id"], []).append(r)
+        for bid, members in groups.items():
+            reported_sizes = {m["batch_size"] for m in members}
+            consistent = len(reported_sizes) == 1
+            if not consistent:
+                schema_errors.append({
+                    "case": ",".join(m["case"] for m in members),
+                    "qid": "*",
+                    "reason": f"inconsistent X-Decide-Batch-Size values {sorted(reported_sizes)} for batch_id={bid}",
+                })
+            reported_bs = next(iter(reported_sizes))
+            distinct_tokens = sorted({m["tokens"] for m in members if m["tokens"] is not None})
+            is_mixed = (
+                consistent
+                and reported_bs >= 2
+                and len(members) >= 2
+                and len(distinct_tokens) >= 2
+            )
+            info = {
+                "batch_id": bid,
+                "reported_batch_size": reported_bs,
+                "observed_members": len(members),
+                "cases": [m["case"] for m in members],
+                "distinct_tokens": distinct_tokens,
+                "mixed_length": is_mixed,
+            }
+            observed_batches.append(info)
+            if is_mixed:
+                mixed_batches.append(info)
+        covered = len(mixed_batches) > 0
+    elif any(r["batch_id"] is not None for r in req_records):
+        missing_bid_cases = [r["case"] for r in req_records if r["batch_id"] is None]
+        covered = False
+        coverage_reason = f"partial X-Decide-Batch-Id headers (missing on {missing_bid_cases})"
+    else:
+        batch_id_inferred = True
+        batched_members = [r for r in req_records if r["batch_size"] >= 2]
+        if batched_members:
+            distinct_tokens = sorted({r["tokens"] for r in batched_members if r["tokens"] is not None})
+            is_mixed = len(batched_members) >= 2 and len(distinct_tokens) >= 2
+            info = {
+                "batch_id": None,
+                "reported_batch_size": max(r["batch_size"] for r in batched_members),
+                "observed_members": len(batched_members),
+                "cases": [r["case"] for r in batched_members],
+                "distinct_tokens": distinct_tokens,
+                "mixed_length": is_mixed,
+                "inferred": True,
+            }
+            observed_batches.append(info)
+            if is_mixed:
+                mixed_batches.append(info)
+        for r in req_records:
+            if r["batch_size"] == 1:
+                observed_batches.append({
+                    "batch_id": None,
+                    "reported_batch_size": 1,
+                    "observed_members": 1,
+                    "cases": [r["case"]],
+                    "distinct_tokens": [r["tokens"]] if r["tokens"] is not None else [],
+                    "mixed_length": False,
+                    "inferred": True,
+                })
+        covered = len(mixed_batches) > 0
+
+    if not covered and coverage_reason is None:
+        if any(b["reported_batch_size"] >= 2 for b in observed_batches):
+            coverage_reason = (
+                "no mixed-length batch observed (multi-request batches only contained "
+                "identical token lengths or a single observed request)"
+            )
+        else:
+            coverage_reason = "no multi-request batch observed (all requests ran serially with batch_size=1)"
+
+    accuracy_ok = (
+        not schema_errors
+        and not hard_choice_flips
+        and observed_max_prob_diff <= max_prob_diff
+        and observed_max_score_diff <= max_score_diff
+    )
+    if not accuracy_ok:
+        status = "fail"
+    elif not covered:
+        status = "uncovered"
+    else:
+        status = "pass"
+
+    return {
+        "status": status,
+        "passed": status == "pass",
+        "accuracy_ok": accuracy_ok,
+        "covered": covered,
+        "coverage_reason": coverage_reason,
+        "batch_id_inferred": batch_id_inferred,
+        "schema_errors": schema_errors,
+        "hard_choice_flips": hard_choice_flips,
+        "max_prob_diff": observed_max_prob_diff,
+        "max_score_diff": observed_max_score_diff,
+        "max_prob_diff_detail": max_prob_diff_detail,
+        "max_score_diff_detail": max_score_diff_detail,
+        "max_prob_diff_limit": max_prob_diff,
+        "max_score_diff_limit": max_score_diff,
+        "observed_batches": observed_batches,
+        "mixed_batches": mixed_batches,
+        "requests": req_records,
+    }
+
+
 def mixed_batch_mode(args):
     suite = build_suite()
     # Pick 4 distinct lengths: 400, 1300, 3300, 7000
@@ -1169,17 +1591,20 @@ def mixed_batch_mode(args):
     print(f"Testing mixed-length concurrent batch consistency on {args.url} ...")
     serial = []
     for c in selected:
-        lat, resp = call_systemone(args.url, args.key, c["body"], args.timeout)
-        serial.append((lat, resp))
-        print(f"  serial  {c['name']:24s} tokens={resp['usage']['input_tokens']} lat={lat:.3f}s")
+        lat, resp, meta = call_systemone_with_meta(args.url, args.key, c["body"], args.timeout)
+        serial.append((lat, resp, meta))
+        toks = (resp.get("usage") or {}).get("input_tokens") if isinstance(resp, dict) else None
+        print(f"  serial  {c['name']:24s} tokens={toks} lat={lat:.3f}s")
 
     batched = [None] * len(selected)
     batch_errors = []
     err_lock = threading.Lock()
+    barrier = threading.Barrier(len(selected), timeout=10.0)
 
     def fire(idx):
         try:
-            batched[idx] = call_systemone(args.url, args.key, selected[idx]["body"], args.timeout)
+            barrier.wait()
+            batched[idx] = call_systemone_with_meta(args.url, args.key, selected[idx]["body"], args.timeout)
         except Exception as exc:
             with err_lock:
                 batch_errors.append((selected[idx]["name"], str(exc)))
@@ -1195,26 +1620,61 @@ def mixed_batch_mode(args):
         detail = "; ".join(f"{name}: {err}" for name, err in batch_errors)
         sys.exit(f"Mixed-batch request error(s): {detail}")
 
-    max_diff = 0.0
-    for c, (_, s_resp), (b_lat, b_resp) in zip(selected, serial, batched, strict=True):
-        b_answers = b_resp.get("answers", {})
-        for qid, s_ans in s_resp["answers"].items():
-            if qid not in b_answers:
-                sys.exit(f"Mixed-batch response missing question {c['name']}.{qid}")
-            b_ans = b_answers[qid]
-            if s_ans["type"] == "noul":
-                max_diff = max(max_diff, abs(s_ans["noul"] - b_ans["noul"]))
-            else:
-                b_probs = b_ans.get("probabilities", {})
-                for k, sp in s_ans["probabilities"].items():
-                    if k not in b_probs:
-                        sys.exit(f"Mixed-batch response missing key {c['name']}.{qid}.{k}")
-                    max_diff = max(max_diff, abs(sp - b_probs[k]))
-        print(f"  batched {c['name']:24s} lat={b_lat:.3f}s")
-    print(f"Mixed-batch wall={wall:.3f}s (vs sum serial={sum(x[0] for x in serial):.3f}s), max_prob_diff={max_diff:.6e}")
-    if max_diff > 1e-3:
-        print("WARNING: non-trivial batch vs serial probability difference!", file=sys.stderr)
+    report = evaluate_mixed_batch(
+        selected,
+        serial,
+        batched,
+        max_prob_diff=args.max_mixed_prob_diff,
+        max_score_diff=args.max_mixed_score_diff,
+    )
+    for r in report["requests"]:
+        bs_str = str(r["batch_size"]) if r["batch_size"] is not None else "-"
+        bid_str = str(r["batch_id"]) if r["batch_id"] is not None else "-"
+        print(
+            f"  batched {r['case']:24s} tokens={r['tokens']} "
+            f"batch_size={bs_str} batch_id={bid_str} lat={r['batched_lat']:.3f}s"
+        )
+    print(
+        f"Mixed-batch wall={wall:.3f}s (vs sum serial={sum(x[0] for x in serial):.3f}s), "
+        f"max_prob_diff={report['max_prob_diff']:.6e}, max_score_diff={report['max_score_diff']:.6e}, "
+        f"mixed_batches={len(report['mixed_batches'])}/{len(report['observed_batches'])}"
+    )
+
+    if report["status"] == "fail":
+        for e in report["schema_errors"]:
+            print(f"Schema error {e['case']}.{e['qid']}: {e['reason']}", file=sys.stderr)
+        for f in report["hard_choice_flips"]:
+            print(
+                f"Choice flip {f['case']}.{f['qid']}: {f['serial_choice']} -> {f['batched_choice']} "
+                f"(margin={f['margin']:.4f})",
+                file=sys.stderr,
+            )
+        if report["max_prob_diff"] > report["max_prob_diff_limit"] and report["max_prob_diff_detail"]:
+            d = report["max_prob_diff_detail"]
+            k_part = f".{d['key']}" if d["key"] is not None else ""
+            print(
+                f"Max prob diff {d['case']}.{d['qid']}{k_part}: "
+                f"serial={d['serial']:.6f} vs batched={d['batched']:.6f} "
+                f"(diff={d['diff']:.6e} > limit={report['max_prob_diff_limit']:.6e})",
+                file=sys.stderr,
+            )
+        if report["max_score_diff"] > report["max_score_diff_limit"] and report["max_score_diff_detail"]:
+            d = report["max_score_diff_detail"]
+            print(
+                f"Max score diff {d['case']}.{d['qid']}: "
+                f"serial={d['serial']:.6f} vs batched={d['batched']:.6f} "
+                f"(diff={d['diff']:.6e} > limit={report['max_score_diff_limit']:.6e})",
+                file=sys.stderr,
+            )
+        print("FAIL: mixed-batch schema or accuracy consistency regression!", file=sys.stderr)
         sys.exit(2)
+    if report["status"] == "uncovered":
+        print(
+            f"NOT COVERED: {report['coverage_reason']}. "
+            "Ensure server runs with DECIDE_MAX_BATCH_SIZE >= 2 and sufficient DECIDE_BATCH_WAIT_MS.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
 
 
 def main():
@@ -1232,6 +1692,8 @@ def main():
     ap.add_argument("--max-prob-p95", type=float, default=0.005, help="max all-option prob p95 under --check (default: 0.005)")
     ap.add_argument("--max-prob-diff", type=float, default=0.02, help="max single prob diff under --check (default: 0.02)")
     ap.add_argument("--max-score-mae", type=float, default=0.005, help="max expected score MAE under --check (default: 0.005)")
+    ap.add_argument("--max-mixed-prob-diff", type=float, default=5e-3, help="max prob diff in --mixed-batch (default: 5e-3)")
+    ap.add_argument("--max-mixed-score-diff", type=float, default=5e-3, help="max score diff in --mixed-batch (default: 5e-3)")
     ap.add_argument("--json-out", default=None, help="write comparison report JSON to path")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--record", help="record reference responses to JSON")

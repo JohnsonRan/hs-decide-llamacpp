@@ -51,6 +51,7 @@ class RequestMetrics:
     tok_s: float = 0.0
     wait_ms: float = 0.0
     batch_size: int = 1
+    batch_id: int = 0
 
 
 def ensure_warning_logger() -> None:
@@ -524,6 +525,7 @@ class LlamaCppDecider:
         if max(self.ids) >= vocab_size:
             raise RuntimeError(f"Classifier token id {max(self.ids)} >= gguf vocab {vocab_size}")
         self.device_label = detect_device_label(gpu_layers)
+        self.last_batch_fell_back: bool = False
 
     def close(self) -> None:
         if getattr(self, "_eng", None):
@@ -578,12 +580,14 @@ class LlamaCppDecider:
         return per_req
 
     def eval_batch(self, rendered_list: list[Any]) -> list[list[list[float]]]:
+        self.last_batch_fell_back = False
         try:
             return self._eval_once(rendered_list)
         except Exception as err:
             if len(rendered_list) <= 1:
                 raise
             logger.warning("Multi-sequence batch failed (%s); falling back to serial", err)
+            self.last_batch_fell_back = True
             return [self._eval_once([item])[0] for item in rendered_list]
 
 
@@ -618,9 +622,11 @@ def create_app(
     fair_q = FairQueue(max_size=max_queue_size, max_per_key=max_queue_per_key)
     cond = asyncio.Condition()
     stop_flag = False
+    next_batch_id = 0
     req_log = setup_request_logger()
 
     async def batch_worker() -> None:
+        nonlocal next_batch_id
         while True:
             async with cond:
                 while fair_q.total_pending() == 0 and not stop_flag:
@@ -648,6 +654,7 @@ def create_app(
                 batch: list[PendingItem] = []
                 batch_tokens = 0
                 batch_slots = 0
+                batch_token_limit = min(decider.max_batch_tokens, decider.ctx_size)
                 while len(batch) < decider.max_batch_size:
                     popped = fair_q.pop_next(now=now)
                     if popped is None:
@@ -656,7 +663,7 @@ def create_app(
                     t = nxt.rendered.tokens()
                     s = len(nxt.rendered.questions)
                     if batch and (
-                        batch_tokens + t > decider.max_batch_tokens
+                        batch_tokens + t > batch_token_limit
                         or batch_slots + s > decider.max_outputs
                     ):
                         fair_q.push_front(tid, nxt)
@@ -681,8 +688,18 @@ def create_app(
                 t_eval1 = time.monotonic()
                 eval_ms = max(t_eval1 - t_eval0, 1e-6) * 1000.0
                 tok_s = batch_tokens / max(t_eval1 - t_eval0, 1e-6)
-                bs = len(batch)
+                fell_back = bool(getattr(decider, "last_batch_fell_back", False))
+                actual_bs = 1 if fell_back else len(batch)
+                shared_batch_id = 0
+                if not fell_back:
+                    next_batch_id += 1
+                    shared_batch_id = next_batch_id
                 for item, rows in zip(batch, rows_list, strict=True):
+                    if fell_back:
+                        next_batch_id += 1
+                        item_batch_id = next_batch_id
+                    else:
+                        item_batch_id = shared_batch_id
                     wait_ms = max(0.0, (t_eval0 - item.enqueued_at) * 1000.0) if item.enqueued_at > 0 else 0.0
                     if item.metrics is not None:
                         item.metrics.tokens = item.rendered.tokens()
@@ -690,7 +707,8 @@ def create_app(
                         item.metrics.eval_ms = eval_ms
                         item.metrics.tok_s = tok_s
                         item.metrics.wait_ms = wait_ms
-                        item.metrics.batch_size = bs
+                        item.metrics.batch_size = actual_bs
+                        item.metrics.batch_id = item_batch_id
                     if not item.future.done():
                         item.future.set_result(
                             response(item.request, item.rendered, rows, decider.ids)
@@ -769,6 +787,9 @@ def create_app(
             )
             resp.headers["X-Decide-Queue-Ms"] = f"{used_metrics.wait_ms:.2f}"
             resp.headers["X-Decide-Eval-Ms"] = f"{used_metrics.eval_ms:.2f}"
+            resp.headers["X-Decide-Batch-Size"] = str(used_metrics.batch_size)
+            if used_metrics.batch_id > 0:
+                resp.headers["X-Decide-Batch-Id"] = str(used_metrics.batch_id)
         if not (path == "/health" and resp.status_code == 200):
             _log(
                 resp.status_code,

@@ -119,7 +119,7 @@ To keep shared endpoints responsive under bursts instead of accumulating unbound
 | `DECIDE_QUEUE_TIMEOUT_S` | `60` | Pre-start queue wait deadline in seconds; expired items are evicted before GPU eval and return `503` (`0` disables). Requests already executing on GPU finish normally |
 
 - **Disconnect cancellation**: if a client closes the connection while queued, the pending item is evicted immediately (returning `499` in access logs) instead of burning GPU cycles on a dead request.
-- **Timing headers**: successful `/v1/systemone` responses include `Server-Timing: queue;dur=..., eval;dur=...`, `X-Decide-Queue-Ms`, and `X-Decide-Eval-Ms` so benchmarks and proxies can separate queue wait from GPU eval time.
+- **Timing & batch headers**: successful `/v1/systemone` responses include `Server-Timing: queue;dur=..., eval;dur=...`, `X-Decide-Queue-Ms`, `X-Decide-Eval-Ms`, `X-Decide-Batch-Size`, and `X-Decide-Batch-Id` so benchmarks and proxies can separate queue wait from GPU eval time and observe actual batch execution (falling back to `X-Decide-Batch-Size: 1` with distinct IDs if multi-sequence eval falls back to serial).
 
 ## Benchmarking & Accuracy Tools
 
@@ -138,7 +138,7 @@ DECIDE_API_KEY=... python3 tools/diff_accuracy.py --record ref.json --url http:/
 DECIDE_API_KEY=... python3 tools/diff_accuracy.py --compare ref.json --url http://127.0.0.1:8000 --check
 ```
 
-`tools/diff_accuracy.py` includes 24 EN/ZH regression cases spanning near-tie `choice`, near-0.5 `noul`, `score` argmax/rounding boundaries (`SUFFICIENCY_LEVELS`, `CUT_LEVELS`), Hindsight's 5-option page-impact gate, 24-question multi-slot requests, and `11k–14k` long-context stress cases. Pass `--check` to exit non-zero on non-borderline decision flips or excessive probability/score drift (use `--max-tier-tokens 8000` when recording against an 8k-window reference server).
+`tools/diff_accuracy.py` includes 24 EN/ZH regression cases spanning near-tie `choice`, near-0.5 `noul`, `score` argmax/rounding boundaries (`SUFFICIENCY_LEVELS`, `CUT_LEVELS`), Hindsight's 5-option page-impact gate, 24-question multi-slot requests, and `11k–14k` long-context stress cases. Pass `--check` to exit non-zero on schema regressions, non-borderline decision flips, or excessive probability/score drift (use `--max-tier-tokens 8000` when recording against an 8k-window reference server). Passing `--mixed-batch` verifies both numerical consistency and real mixed-length batch execution via `X-Decide-Batch-Size` / `X-Decide-Batch-Id`, exiting with code `3` (`NOT COVERED`) against default `DECIDE_MAX_BATCH_SIZE=1` instances.
 
 ## License
 
